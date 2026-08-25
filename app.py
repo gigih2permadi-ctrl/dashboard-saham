@@ -9,6 +9,8 @@ import textwrap
 from io import BytesIO
 import requests
 import re
+import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from bs4 import BeautifulSoup
 
 
@@ -2881,6 +2883,289 @@ def calculate_similarity(
 
 
 # =========================================================
+# BROKER / BANDAR FLOW
+# =========================================================
+
+def _get_secret_value(name):
+    """Read a Streamlit secret first, then an environment variable."""
+    try:
+        value = st.secrets.get(name, "")
+        if value:
+            return str(value).strip()
+    except Exception:
+        pass
+    return os.getenv(name, "").strip()
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_broker_summary_day(ticker, trade_date, investor="all", market="RG"):
+    """Fetch one completed trading day's broker summary.
+
+    Index Alpha returns one row per broker. A single-day request is used
+    intentionally because multi-day requests are aggregated by broker.
+    """
+    api_key = _get_secret_value("INDEX_ALPHA_API_KEY")
+    if not api_key:
+        return pd.DataFrame()
+
+    url = "https://api.indexalpha.id/stocks/broker-summary"
+    params = {
+        "ticker": ticker.replace(".JK", "").upper(),
+        "from": str(trade_date),
+        "to": str(trade_date),
+        "investor": investor,
+        "market": market,
+    }
+    headers = {
+        "accept": "application/json",
+        "Authorization": f"Bearer {api_key}",
+    }
+
+    try:
+        r = requests.get(url, params=params, headers=headers, timeout=20)
+        if r.status_code != 200:
+            return pd.DataFrame()
+        payload = r.json()
+        rows = payload.get("data", []) if isinstance(payload, dict) else []
+        if not rows:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(rows)
+        numeric_cols = [
+            "buy_freq", "buy_volume", "buy_value",
+            "sell_freq", "sell_volume", "sell_value",
+            "buy_avg", "sell_avg",
+        ]
+        for col in numeric_cols:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+
+        df["broker"] = df["code"].astype(str).str.upper()
+        df["net_value"] = df["buy_value"] - df["sell_value"]
+        df["net_volume"] = df["buy_volume"] - df["sell_volume"]
+        df["date"] = pd.Timestamp(trade_date)
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_broker_flow_range(ticker, dates, investor="all", market="RG"):
+    """Fetch daily broker summaries for a list of trading dates."""
+    dates = [pd.Timestamp(x).date() for x in dates]
+    if not dates:
+        return pd.DataFrame()
+
+    # Parallel requests make a 60-day window practical while respecting
+    # normal API rate limits. Individual calls are cached above.
+    frames = []
+    max_workers = min(6, max(1, len(dates)))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(fetch_broker_summary_day, ticker, d, investor, market): d
+            for d in dates
+        }
+        for future in as_completed(futures):
+            try:
+                result = future.result()
+                if not result.empty:
+                    frames.append(result)
+            except Exception:
+                continue
+
+    if not frames:
+        return pd.DataFrame()
+
+    return (
+        pd.concat(frames, ignore_index=True)
+        .sort_values(["date", "net_value"], ascending=[True, False])
+        .reset_index(drop=True)
+    )
+
+
+def build_daily_broker_flow_summary(flow_df):
+    """Create one row per date showing the leading 3 accumulators/distributors."""
+    if flow_df.empty:
+        return pd.DataFrame()
+
+    rows = []
+    for dt, g in flow_df.groupby("date", sort=True):
+        g = g.copy()
+        acc = g[g["net_value"] > 0].sort_values("net_value", ascending=False).head(3)
+        dist = g[g["net_value"] < 0].sort_values("net_value", ascending=True).head(3)
+
+        acc_text = " • ".join(
+            f"{r.broker} ({r.net_value/1e9:+.2f}B)"
+            for r in acc.itertuples()
+        ) or "-"
+        dist_text = " • ".join(
+            f"{r.broker} ({abs(r.net_value)/1e9:.2f}B)"
+            for r in dist.itertuples()
+        ) or "-"
+
+        rows.append({
+            "Tanggal": pd.Timestamp(dt).strftime("%d-%m-%Y"),
+            "Top 3 Akumulasi": acc_text,
+            "Top 3 Distribusi": dist_text,
+        })
+
+    return pd.DataFrame(rows)
+
+
+def render_broker_flow_module(ticker, stock_data, end_date, broker_window=60):
+    """Render broker/bandar movement replacing stock-vs-IHSG/similar stocks."""
+    st.divider()
+    st.subheader("🏦 PERGERAKAN BANDAR / BROKER FLOW")
+    st.caption(
+        "Akumulasi = net buy broker; distribusi = net sell broker. "
+        "Kode broker menunjukkan broker transaksi, bukan identitas investor akhir."
+    )
+
+    api_key = _get_secret_value("INDEX_ALPHA_API_KEY")
+    if not api_key:
+        st.warning(
+            "Data broker belum aktif. Tambahkan `INDEX_ALPHA_API_KEY` ke "
+            "Streamlit Secrets agar kode broker, akumulasi, dan distribusi harian "
+            "dapat ditampilkan."
+        )
+        st.info(
+            "API broker yang digunakan menyediakan buy/sell value, volume, dan "
+            "average price per broker. Data historis tersedia mulai 1 Januari 2025."
+        )
+        return
+
+    # Use actual stock trading dates, then keep only the supported broker-data era.
+    dates = pd.to_datetime(stock_data["Date"], errors="coerce").dropna().dt.normalize().drop_duplicates().sort_values()
+    dates = dates[dates <= pd.Timestamp(end_date)]
+    dates = dates[dates >= pd.Timestamp("2025-01-01")]
+
+    if dates.empty:
+        st.info("Belum ada tanggal yang masuk periode data broker.")
+        return
+
+    # Window is deliberately configurable so 2/5/10-year seasonality does not
+    # trigger hundreds of broker API calls on every page load.
+    if broker_window > 0:
+        dates = dates.tail(int(broker_window))
+
+    with st.spinner(f"Mengambil broker flow {len(dates)} hari..."):
+        flow = fetch_broker_flow_range(ticker, dates.tolist())
+
+    if flow.empty:
+        st.error(
+            "Data broker tidak berhasil diambil. Periksa API key, kuota API, "
+            "atau tanggal perdagangan."
+        )
+        return
+
+    daily = build_daily_broker_flow_summary(flow)
+    end_dt = pd.Timestamp(end_date)
+    available_end = flow[flow["date"] <= end_dt]["date"].max()
+    end_flow = flow[flow["date"] == available_end].copy()
+
+    # Top 3 on the selected end date.
+    top_acc = end_flow.sort_values("net_value", ascending=False).head(3).copy()
+    top_dist = end_flow.sort_values("net_value", ascending=True).head(3).copy()
+
+    c1, c2 = st.columns(2, gap="medium")
+
+    with c1:
+        st.markdown("### 🟢 Top 3 Akumulasi")
+        acc_show = top_acc[["broker", "buy_value", "sell_value", "net_value", "buy_avg", "sell_avg"]].copy()
+        acc_show.columns = ["Broker", "Buy Value", "Sell Value", "Net Buy", "Avg Buy", "Avg Sell"]
+        st.dataframe(
+            acc_show.style.format({
+                "Buy Value": lambda x: f"Rp {x/1e9:,.2f} B",
+                "Sell Value": lambda x: f"Rp {x/1e9:,.2f} B",
+                "Net Buy": lambda x: f"Rp {x/1e9:,.2f} B",
+                "Avg Buy": lambda x: f"Rp {x:,.0f}",
+                "Avg Sell": lambda x: f"Rp {x:,.0f}",
+            }),
+            use_container_width=True, hide_index=True, height=150
+        )
+
+    with c2:
+        st.markdown("### 🔴 Top 3 Distribusi")
+        dist_show = top_dist[["broker", "buy_value", "sell_value", "net_value", "buy_avg", "sell_avg"]].copy()
+        dist_show["net_value"] = dist_show["net_value"].abs()
+        dist_show.columns = ["Broker", "Buy Value", "Sell Value", "Net Sell", "Avg Buy", "Avg Sell"]
+        st.dataframe(
+            dist_show.style.format({
+                "Buy Value": lambda x: f"Rp {x/1e9:,.2f} B",
+                "Sell Value": lambda x: f"Rp {x/1e9:,.2f} B",
+                "Net Sell": lambda x: f"Rp {x/1e9:,.2f} B",
+                "Avg Buy": lambda x: f"Rp {x:,.0f}",
+                "Avg Sell": lambda x: f"Rp {x:,.0f}",
+            }),
+            use_container_width=True, hide_index=True, height=150
+        )
+
+    st.caption(
+        f"End date broker summary: {pd.Timestamp(available_end).strftime('%d-%m-%Y')} "
+        f"• Window: {pd.Timestamp(dates.min()).strftime('%d-%m-%Y')} – "
+        f"{pd.Timestamp(dates.max()).strftime('%d-%m-%Y')}"
+    )
+
+    # Daily movement chart: total positive vs total negative broker net value.
+    daily_chart = (
+        flow.assign(
+            Accumulation=flow["net_value"].clip(lower=0),
+            Distribution=flow["net_value"].clip(upper=0),
+        )
+        .groupby("date")[["Accumulation", "Distribution"]]
+        .sum()
+        .reset_index()
+    )
+
+    fig_flow = go.Figure()
+    fig_flow.add_trace(go.Bar(
+        x=daily_chart["date"], y=daily_chart["Accumulation"],
+        name="Akumulasi", marker_color="#22c55e"
+    ))
+    fig_flow.add_trace(go.Bar(
+        x=daily_chart["date"], y=daily_chart["Distribution"],
+        name="Distribusi", marker_color="#ef4444"
+    ))
+    fig_flow.add_hline(y=0, line_width=1, line_color="#777")
+    fig_flow.update_layout(
+        template="plotly_dark", paper_bgcolor="#11161d", plot_bgcolor="#11161d",
+        height=320, barmode="relative",
+        yaxis=dict(title="Net Broker Flow (Rp)", tickformat=".2s"),
+        margin=dict(l=10, r=10, t=20, b=10),
+        legend=dict(orientation="h", y=1.08, x=0),
+    )
+    st.plotly_chart(fig_flow, use_container_width=True, config={"displayModeBar": False})
+
+    st.markdown("### 📅 Distribusi Broker Per Hari")
+    st.dataframe(
+        daily.sort_values("Tanggal", ascending=False),
+        use_container_width=True, hide_index=True, height=300
+    )
+
+    # Cumulative broker leaderboard across the displayed window.
+    cumulative = (
+        flow.groupby("broker", as_index=False)["net_value"]
+        .sum()
+        .sort_values("net_value", ascending=False)
+    )
+    cum_acc = cumulative.head(3).copy()
+    cum_dist = cumulative.sort_values("net_value").head(3).copy()
+    q1, q2 = st.columns(2)
+    with q1:
+        st.markdown("### 🟢 Top 3 Akumulasi Kumulatif")
+        st.dataframe(
+            cum_acc.rename(columns={"broker":"Broker", "net_value":"Net Buy"})
+            .assign(**{"Net Buy": lambda d: d["Net Buy"].map(lambda x: f"Rp {x/1e9:,.2f} B")}),
+            use_container_width=True, hide_index=True
+        )
+    with q2:
+        st.markdown("### 🔴 Top 3 Distribusi Kumulatif")
+        cum_dist = cum_dist.rename(columns={"broker":"Broker", "net_value":"Net Sell"}).copy()
+        cum_dist["Net Sell"] = cum_dist["Net Sell"].abs().map(lambda x: f"Rp {x/1e9:,.2f} B")
+        st.dataframe(cum_dist, use_container_width=True, hide_index=True)
+
+
+# =========================================================
 # SIMILAR STOCKS
 # =========================================================
 
@@ -3999,6 +4284,7 @@ IDX_SECTORS = {
         "full_name": "Energy",
         "icon": "🔥",
         "symbol": "JKENERGY",
+        "google_symbol": "IDXENERGY:IDX",
         "url": "https://id.investing.com/indices/indonesia-se-energy",
     },
     "basic": {
@@ -4006,6 +4292,7 @@ IDX_SECTORS = {
         "full_name": "Basic Materials",
         "icon": "🧪",
         "symbol": "JKBASIC",
+        "google_symbol": "IDXBASIC:IDX",
         "url": "https://id.investing.com/indices/indonesia-se-basic-materials",
     },
     "industrial": {
@@ -4013,6 +4300,7 @@ IDX_SECTORS = {
         "full_name": "Industrials",
         "icon": "🏭",
         "symbol": "JKINDUST",
+        "google_symbol": "IDXINDUST:IDX",
         "url": "https://id.investing.com/indices/indonesia-se-industrials",
     },
     "noncyclical": {
@@ -4020,6 +4308,7 @@ IDX_SECTORS = {
         "full_name": "Consumer Non-Cyclicals",
         "icon": "🛒",
         "symbol": "JKNONCYC",
+        "google_symbol": "IDXNONCYC:IDX",
         "url": "https://id.investing.com/indices/indonesia-se-consumer-noncyclicals",
     },
     "cyclical": {
@@ -4027,6 +4316,7 @@ IDX_SECTORS = {
         "full_name": "Consumer Cyclicals",
         "icon": "👕",
         "symbol": "JKCYCLIC",
+        "google_symbol": "IDXCYCLIC:IDX",
         "url": "https://id.investing.com/indices/indonesia-se-consumer-cyclical",
     },
     "finance": {
@@ -4034,6 +4324,7 @@ IDX_SECTORS = {
         "full_name": "Financials",
         "icon": "💰",
         "symbol": "JKFINANCE",
+        "google_symbol": "IDXFINANCE:IDX",
         "url": "https://id.investing.com/indices/idx-finance",
     },
     "health": {
@@ -4041,6 +4332,7 @@ IDX_SECTORS = {
         "full_name": "Healthcare",
         "icon": "🏥",
         "symbol": "JKHEALTH",
+        "google_symbol": "IDXHEALTH:IDX",
         "url": "https://id.investing.com/indices/indonesia-se-healthcare",
     },
     "property": {
@@ -4048,6 +4340,7 @@ IDX_SECTORS = {
         "full_name": "Properties & Real Estate",
         "icon": "🏠",
         "symbol": "JKPROP",
+        "google_symbol": "IDXPROPERT:IDX",
         "url": "https://id.investing.com/indices/idx-cons.-property---real-estate",
     },
     "technology": {
@@ -4055,6 +4348,7 @@ IDX_SECTORS = {
         "full_name": "Technology",
         "icon": "💻",
         "symbol": "JKTECHNO",
+        "google_symbol": "IDXTECHNO:IDX",
         "url": "https://id.investing.com/indices/indonesia-se-technology",
     },
     "infra": {
@@ -4062,6 +4356,7 @@ IDX_SECTORS = {
         "full_name": "Infrastructure",
         "icon": "🛣️",
         "symbol": "JKINFRA",
+        "google_symbol": "IDXINFRA:IDX",
         "url": "https://id.investing.com/indices/idx-infrastructure",
     },
     "transport": {
@@ -4069,6 +4364,7 @@ IDX_SECTORS = {
         "full_name": "Transportation & Logistics",
         "icon": "✈️",
         "symbol": "JKTRANS",
+        "google_symbol": "IDXTRANS:IDX",
         "url": "https://id.investing.com/indices/indonesia-se-transportation",
     },
 }
@@ -4141,10 +4437,50 @@ def idx_parse_index_page(html, symbol):
     return {"price":np.nan,"change":np.nan,"status":"PARSE FAILED"}
 
 @st.cache_data(ttl=300, show_spinner=False)
+def google_finance_quote(symbol):
+    """Fallback quote source for Community Cloud."""
+    try:
+        url = f"https://www.google.com/finance/quote/{symbol}?hl=id"
+        r = requests.get(
+            url,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/139.0 Safari/537.36",
+                "Accept-Language": "id-ID,id;q=0.9,en;q=0.8",
+            },
+            timeout=20,
+        )
+        if r.status_code != 200:
+            return {"price":np.nan,"change":np.nan,"status":f"HTTP {r.status_code}"}
+        text = BeautifulSoup(r.text, "html.parser").get_text(" ", strip=True)
+        key = re.escape(symbol.split(":")[0])
+        patterns = [
+            rf"{key}.*?(\d[\d.,]*)\s*([+-]\d[\d.,]*)\s*%\s*\(",
+            rf"{key}.*?(\d[\d.,]*)\s*([+-]\d[\d.,]*)\s*%",
+        ]
+        for pat in patterns:
+            m = re.search(pat, text, flags=re.I|re.S)
+            if m:
+                price = idx_parse_number(m.group(1))
+                change = idx_parse_number(m.group(2))
+                if np.isfinite(price) and np.isfinite(change) and price > 10:
+                    return {"price":price,"change":change,"status":"OK"}
+        return {"price":np.nan,"change":np.nan,"status":"PARSE FAILED"}
+    except Exception as e:
+        return {"price":np.nan,"change":np.nan,"status":f"ERROR {type(e).__name__}"}
+
+
+@st.cache_data(ttl=300, show_spinner=False)
 def idx_get_sector(code):
     cfg=IDX_SECTORS[code]
     html=idx_fetch_page(cfg["url"])
     result=idx_parse_index_page(html,cfg["symbol"])
+
+    # Community Cloud fallback: Investing.com can return an anti-bot page.
+    if not (np.isfinite(result["price"]) and np.isfinite(result["change"])):
+        gf = google_finance_quote(cfg.get("google_symbol", "")) if cfg.get("google_symbol") else None
+        if gf and np.isfinite(gf["price"]) and np.isfinite(gf["change"]):
+            result = gf
+
     return {
         "code":code, "name":cfg["name"], "full_name":cfg["full_name"],
         "icon":cfg["icon"], "symbol":cfg["symbol"],
@@ -4156,23 +4492,52 @@ def idx_get_sector(code):
 def idx_get_all_sectors():
     return [idx_get_sector(code) for code in IDX_SECTORS]
 
+@st.cache_data(ttl=300, show_spinner=False)
+def idx_get_ihsg_overview():
+    # Primary: Yahoo Finance ^JKSE.
+    try:
+        raw = yf.download(
+            "^JKSE", period="5d", interval="1d", auto_adjust=False,
+            progress=False, threads=False, group_by="column"
+        )
+        raw = _flat_ohlcv(raw)
+        if not raw.empty:
+            close = float(raw["Close"].iloc[-1])
+            change = np.nan
+            if len(raw) >= 2:
+                prev = float(raw["Close"].iloc[-2])
+                if prev:
+                    change = (close / prev - 1) * 100
+            if np.isfinite(close):
+                return {"price":close,"change":change,"status":"OK"}
+    except Exception:
+        pass
+    return google_finance_quote("COMPOSITE:IDX")
+
+
 def render_idx_sector_module():
     st.markdown("## 🇮🇩 SEKTORAL IDX")
     st.caption("Kondisi 11 sektor IDX-IC. Data ditampilkan sebagai market overview, bukan hasil perhitungan seasonality.")
 
     sectors = idx_get_all_sectors()
     valid = [x for x in sectors if pd.notna(x["change"])]
+    ihsg = idx_get_ihsg_overview()
 
     if valid:
         best=max(valid,key=lambda x:x["change"])
         worst=min(valid,key=lambda x:x["change"])
         avg=float(np.mean([x["change"] for x in valid]))
-        a,b,c=st.columns(3)
-        a.metric("Sektor Terkuat", best["full_name"], f'{best["change"]:+.2f}%')
-        b.metric("Sektor Terlemah", worst["full_name"], f'{worst["change"]:+.2f}%')
-        c.metric("Rata-rata 11 Sektor", f"{avg:+.2f}%")
+        a,b,c,d=st.columns(4)
+        a.metric("IHSG", f'{ihsg["price"]:,.2f}' if np.isfinite(ihsg["price"]) else "N/A",
+                 f'{ihsg["change"]:+.2f}%' if np.isfinite(ihsg["change"]) else None)
+        b.metric("Sektor Terkuat", best["full_name"], f'{best["change"]:+.2f}%')
+        c.metric("Sektor Terlemah", worst["full_name"], f'{worst["change"]:+.2f}%')
+        d.metric("Rata-rata 11 Sektor", f"{avg:+.2f}%")
     else:
         st.warning("Data sektor IDX belum berhasil dibaca dari sumber data.")
+        if np.isfinite(ihsg["price"]):
+            st.metric("IHSG", f'{ihsg["price"]:,.2f}',
+                      f'{ihsg["change"]:+.2f}%' if np.isfinite(ihsg["change"]) else None)
 
     st.markdown("### 📊 Kondisi Sektor Hari Ini")
     for start in range(0,len(sectors),3):
@@ -4231,7 +4596,8 @@ if analysis_mode.startswith("📅"):
         index=3
     )
     period = PERIOD_OPTIONS[period_label]
-    top_n = st.sidebar.slider("Similar Stocks", 5, 30, 10)
+    # Similar Stocks is no longer rendered in the main seasonality panel.
+    # Broker Flow replaces that section.
     analyze = True
 elif analysis_mode.startswith("🇮🇩"):
     st.sidebar.subheader("🇮🇩 Sektoral IDX")
@@ -5239,279 +5605,22 @@ if analysis_mode.startswith("📅"):
                 "bukan sebagai sinyal entry tunggal."
             )
 
-    # STOCK VS IHSG + SIMILAR
     # =====================================================
-
-    st.divider()
-
-    col_ihsg, col_similar = st.columns(
-        [1.25, 1],
-        gap="small"
+    # BROKER / BANDAR FLOW — replaces STOCK VS IHSG + SIMILAR STOCKS
+    # =====================================================
+    broker_window = st.sidebar.selectbox(
+        "Broker Flow History",
+        [5, 20, 40, 60, 120, 250],
+        index=0,
+        help="Jumlah hari perdagangan yang ditampilkan pada Broker Flow."
     )
 
-    with col_ihsg:
-
-        st.subheader(
-            f"📈 {ticker} vs IHSG"
-        )
-
-        with st.spinner(
-            "Mengambil data IHSG..."
-        ):
-
-            ihsg_data = download_ihsg(
-                period
-            )
-
-        if ihsg_data.empty:
-
-            st.warning(
-                "Data IHSG tidak tersedia."
-            )
-
-        else:
-
-            stock_monthly = (
-                calculate_monthly_returns(
-                    stock_data
-                )
-            )
-
-            ihsg_monthly = (
-                calculate_monthly_returns(
-                    ihsg_data
-                )
-            )
-
-            stock_avg = (
-                stock_monthly
-                .groupby("Month")[
-                    "Return"
-                ]
-                .mean()
-            )
-
-            ihsg_avg = (
-                ihsg_monthly
-                .groupby("Month")[
-                    "Return"
-                ]
-                .mean()
-            )
-
-            compare = pd.DataFrame(
-                {
-                    ticker:
-                    stock_avg,
-
-                    "IHSG":
-                    ihsg_avg
-                }
-            )
-
-            compare = (
-                compare
-                .reindex(
-                    range(1, 13)
-                )
-            )
-
-            compare["Month"] = (
-                compare.index
-                .map(MONTH_NAMES)
-            )
-
-            compare["Outperformance"] = (
-                compare[ticker]
-                -
-                compare["IHSG"]
-            )
-
-            fig_compare = go.Figure()
-
-            fig_compare.add_trace(
-                go.Bar(
-                    x=compare["Month"],
-                    y=compare[ticker],
-                    name=ticker,
-                    marker_color="#35d07f"
-                )
-            )
-
-            fig_compare.add_trace(
-                go.Scatter(
-                    x=compare["Month"],
-                    y=compare["IHSG"],
-                    name="IHSG",
-                    mode="lines+markers",
-                    line=dict(
-                        color="#f5a623",
-                        width=2
-                    )
-                )
-            )
-
-            fig_compare.add_hline(
-                y=0,
-                line_width=1,
-                line_color="#888888"
-            )
-
-            fig_compare.update_layout(
-                template="plotly_dark",
-                paper_bgcolor="#11161d",
-                plot_bgcolor="#11161d",
-                height=330,
-                yaxis_tickformat=".1%",
-                margin=dict(
-                    l=10,
-                    r=10,
-                    t=20,
-                    b=5
-                )
-            )
-
-            st.plotly_chart(
-                fig_compare,
-                use_container_width=True,
-                config={
-                    "displayModeBar": False
-                }
-            )
-
-            best_relative = compare.loc[
-                compare[
-                    "Outperformance"
-                ].idxmax()
-            ]
-
-            worst_relative = compare.loc[
-                compare[
-                    "Outperformance"
-                ].idxmin()
-            ]
-
-            r1, r2 = st.columns(2)
-
-            r1.metric(
-                "Best Relative",
-                best_relative["Month"],
-                f"{best_relative['Outperformance']:.2%}"
-            )
-
-            r2.metric(
-                "Worst Relative",
-                worst_relative["Month"],
-                f"{worst_relative['Outperformance']:.2%}"
-            )
-
-    with col_similar:
-
-        st.subheader(
-            "🔍 SIMILAR STOCKS"
-        )
-
-        st.caption(
-            f"Pola seasonality paling mirip dengan {ticker}"
-        )
-
-        with st.spinner(
-            "Menghitung similarity..."
-        ):
-
-            similarity = (
-                find_similar_stocks(
-                    ticker,
-                    period,
-                    master[
-                        "Ticker"
-                    ].tolist()
-                )
-            )
-
-        if similarity.empty:
-
-            st.warning(
-                "Belum cukup data."
-            )
-
-        else:
-
-            similarity_show = (
-                similarity
-                .head(top_n)
-                .copy()
-            )
-
-            similarity_show[
-                "Similarity"
-            ] = (
-                similarity_show[
-                    "Similarity"
-                ]
-                .round(1)
-            )
-
-            st.dataframe(
-                similarity_show[
-                    [
-                        "Rank",
-                        "Ticker",
-                        "Similarity"
-                    ]
-                ],
-                use_container_width=True,
-                hide_index=True,
-                height=235
-            )
-
-            chart_sim = (
-                similarity
-                .head(top_n)
-                .sort_values(
-                    "Similarity"
-                )
-            )
-
-            fig_sim = go.Figure()
-
-            fig_sim.add_trace(
-                go.Bar(
-                    x=chart_sim[
-                        "Similarity"
-                    ],
-                    y=chart_sim[
-                        "Ticker"
-                    ],
-                    orientation="h",
-                    marker_color="#f5a623"
-                )
-            )
-
-            fig_sim.update_layout(
-                template="plotly_dark",
-                paper_bgcolor="#11161d",
-                plot_bgcolor="#11161d",
-                height=235,
-                xaxis_range=[
-                    0,
-                    100
-                ],
-                margin=dict(
-                    l=10,
-                    r=10,
-                    t=5,
-                    b=5
-                )
-            )
-
-            st.plotly_chart(
-                fig_sim,
-                use_container_width=True,
-                config={
-                    "displayModeBar": False
-                }
-            )
+    render_broker_flow_module(
+        ticker=ticker,
+        stock_data=stock_data,
+        end_date=pd.to_datetime(stock_data["Date"]).max(),
+        broker_window=broker_window,
+    )
 
     # =========================================================
 # TECHNICAL ANALYSIS MODE — ORIGINAL ANALYSIS ENGINE
