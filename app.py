@@ -12,6 +12,142 @@ import re
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from bs4 import BeautifulSoup
+import xml.etree.ElementTree as ET
+from urllib.parse import quote_plus
+
+
+
+def jalankan_backtest(data, threshold):
+    """
+    Backtest sederhana untuk scoring signal.
+
+    Dipakai oleh engine lama untuk mengevaluasi threshold.
+    Fungsi ini sengaja dikembalikan karena kalkulasi backtest tetap dibutuhkan
+    walaupun tabel threshold detail tidak lagi ditampilkan.
+    """
+    df = data.copy()
+
+    if df is None or len(df) < 30:
+        return {
+            "threshold": threshold,
+            "trades": 0,
+            "win_rate": np.nan,
+            "avg_return": np.nan,
+            "total_return": np.nan,
+            "max_drawdown": np.nan,
+            "profit_factor": np.nan,
+        }
+
+    # Pastikan kolom OHLC tersedia.
+    close_col = "Close"
+    if close_col not in df.columns:
+        return {
+            "threshold": threshold,
+            "trades": 0,
+            "win_rate": np.nan,
+            "avg_return": np.nan,
+            "total_return": np.nan,
+            "max_drawdown": np.nan,
+            "profit_factor": np.nan,
+        }
+
+    close = pd.to_numeric(df[close_col], errors="coerce")
+    volume = (
+        pd.to_numeric(df["Volume"], errors="coerce")
+        if "Volume" in df.columns
+        else pd.Series(index=df.index, dtype=float)
+    )
+
+    # Recreate the same general six-factor idea used by the decision engine.
+    ma20 = close.rolling(20).mean()
+    ma50 = close.rolling(50).mean()
+    rsi = _rsi_value_series(close, 14) if "_rsi_value_series" in globals() else None
+
+    if rsi is None:
+        delta = close.diff()
+        gain = delta.clip(lower=0).rolling(14).mean()
+        loss = (-delta.clip(upper=0)).rolling(14).mean()
+        rs = gain / loss.replace(0, np.nan)
+        rsi = 100 - (100 / (1 + rs))
+
+    macd_fast = close.ewm(span=12, adjust=False).mean()
+    macd_slow = close.ewm(span=26, adjust=False).mean()
+    macd_line = macd_fast - macd_slow
+    macd_signal = macd_line.ewm(span=9, adjust=False).mean()
+
+    vol_ma20 = volume.rolling(20).mean()
+
+    # Optional CMF/CMO-style components.
+    high = pd.to_numeric(df["High"], errors="coerce") if "High" in df.columns else close
+    low = pd.to_numeric(df["Low"], errors="coerce") if "Low" in df.columns else close
+
+    mfm = ((close - low) - (high - close)) / (high - low).replace(0, np.nan)
+    cmf = (mfm * volume).rolling(20).sum() / volume.rolling(20).sum()
+
+    cmo_up = close.diff().clip(lower=0).rolling(14).sum()
+    cmo_dn = (-close.diff().clip(upper=0)).rolling(14).sum()
+    cmo = 100 * (cmo_up - cmo_dn) / (cmo_up + cmo_dn).replace(0, np.nan)
+
+    score = (
+        (close > ma20).astype(int)
+        + (ma20 > ma50).astype(int)
+        + (rsi > 50).astype(int)
+        + (macd_line > macd_signal).astype(int)
+        + (cmf > 0).astype(int)
+        + (cmo > 0).astype(int)
+    )
+
+    # Signal occurs when score reaches the selected threshold.
+    signal = score >= int(threshold)
+
+    # Next-period return after signal.
+    fwd_return = close.shift(-1) / close - 1
+    returns = fwd_return[signal].dropna()
+
+    trades = int(len(returns))
+
+    if trades == 0:
+        return {
+            "threshold": threshold,
+            "trades": 0,
+            "win_rate": np.nan,
+            "avg_return": np.nan,
+            "total_return": np.nan,
+            "max_drawdown": np.nan,
+            "profit_factor": np.nan,
+        }
+
+    wins = returns[returns > 0]
+    losses = returns[returns <= 0]
+
+    win_rate = float((returns > 0).mean())
+    avg_return = float(returns.mean())
+
+    # Compound return, not a sum.
+    equity = (1 + returns).cumprod()
+    total_return = float(equity.iloc[-1] - 1)
+
+    running_max = equity.cummax()
+    drawdown = equity / running_max - 1
+    max_drawdown = float(drawdown.min())
+
+    gross_profit = float(wins.sum())
+    gross_loss = float(-losses.sum())
+    profit_factor = (
+        gross_profit / gross_loss
+        if gross_loss > 0
+        else (np.inf if gross_profit > 0 else np.nan)
+    )
+
+    return {
+        "threshold": int(threshold),
+        "trades": trades,
+        "win_rate": win_rate,
+        "avg_return": avg_return,
+        "total_return": total_return,
+        "max_drawdown": max_drawdown,
+        "profit_factor": profit_factor,
+    }
 
 
 def render_html(html):
@@ -1193,127 +1329,65 @@ def add_indicators(df):
 # SUPPORT RESISTANCE
 # =========================================================
 
-def cari_support_resistance(
-    data,
-    lookback=60
-):
-
-    d = data.tail(
-        lookback
-    ).copy()
-
+def cari_support_resistance(data, lookback=60):
+    """
+    Cari support/resistance yang relevan terhadap harga terakhir.
+    Level yang terlalu jauh tidak dipaksakan sebagai 'terdekat'.
+    """
+    d = data.tail(max(int(lookback), 60)).copy()
     if d.empty:
-
         return {
-            "support": np.nan,
-            "support_low": np.nan,
-            "support_high": np.nan,
-            "resistance": np.nan,
-            "resistance_low": np.nan,
-            "resistance_high": np.nan,
+            "support": np.nan, "support_low": np.nan, "support_high": np.nan,
+            "resistance": np.nan, "resistance_low": np.nan, "resistance_high": np.nan,
             "atr": np.nan
         }
 
-    harga = float(
-        d["Close"].iloc[-1]
-    )
-
-    swing_low = (
-        (d["Low"] < d["Low"].shift(1))
-        &
-        (d["Low"] < d["Low"].shift(-1))
-    )
-
-    swing_high = (
-        (d["High"] > d["High"].shift(1))
-        &
-        (d["High"] > d["High"].shift(-1))
-    )
-
-    lows = (
-        d.loc[
-            swing_low,
-            "Low"
-        ].dropna()
-    )
-
-    highs = (
-        d.loc[
-            swing_high,
-            "High"
-        ].dropna()
-    )
-
-    support_candidates = (
-        lows[lows < harga]
-    )
-
-    if not support_candidates.empty:
-
-        support = float(
-            support_candidates.iloc[
-                np.argmin(
-                    np.abs(
-                        support_candidates -
-                        harga
-                    )
-                )
-            ]
-        )
-
-    else:
-
-        support = float(
-            d["Low"].min()
-        )
-
-    resistance_candidates = (
-        highs[highs > harga]
-    )
-
-    if not resistance_candidates.empty:
-
-        resistance = float(
-            resistance_candidates.iloc[
-                np.argmin(
-                    np.abs(
-                        resistance_candidates -
-                        harga
-                    )
-                )
-            ]
-        )
-
-    else:
-
-        resistance = float(
-            d["High"].max()
-        )
-
-    atr_now = d["ATR14"].iloc[-1]
-
-    if pd.isna(atr_now):
-
+    harga = float(d["Close"].iloc[-1])
+    atr_now = pd.to_numeric(d["ATR14"], errors="coerce").iloc[-1]
+    if pd.isna(atr_now) or atr_now <= 0:
         atr_now = harga * 0.02
+    atr_now = float(atr_now)
 
-    else:
+    swing_low = (d["Low"] < d["Low"].shift(1)) & (d["Low"] < d["Low"].shift(-1))
+    swing_high = (d["High"] > d["High"].shift(1)) & (d["High"] > d["High"].shift(-1))
 
-        atr_now = float(
-            atr_now
-        )
+    candidates_s = pd.concat([
+        d.loc[swing_low, "Low"], d.tail(20)["Low"],
+        d.tail(40)["Low"], d.tail(60)["Low"]
+    ]).dropna().astype(float).unique()
+
+    candidates_r = pd.concat([
+        d.loc[swing_high, "High"], d.tail(20)["High"],
+        d.tail(40)["High"], d.tail(60)["High"]
+    ]).dropna().astype(float).unique()
+
+    # Maksimum jarak level "terdekat": 3 ATR atau 8% harga.
+    max_distance = max(3.0 * atr_now, harga * 0.08)
+
+    s_candidates = [x for x in candidates_s if x < harga and (harga - x) <= max_distance]
+    r_candidates = [x for x in candidates_r if x > harga and (x - harga) <= max_distance]
+
+    support = min(s_candidates, key=lambda x: harga - x) if s_candidates else np.nan
+    resistance = min(r_candidates, key=lambda x: x - harga) if r_candidates else np.nan
+
+    if pd.isna(support):
+        recent_low = float(d.tail(20)["Low"].min())
+        if recent_low < harga and (harga - recent_low) <= max_distance:
+            support = recent_low
+
+    if pd.isna(resistance):
+        recent_high = float(d.tail(20)["High"].max())
+        if recent_high > harga and (recent_high - harga) <= max_distance:
+            resistance = recent_high
 
     area = atr_now * 0.30
-
     return {
-
         "support": support,
-        "support_low": support - area,
-        "support_high": support + area,
-
+        "support_low": support - area if pd.notna(support) else np.nan,
+        "support_high": support + area if pd.notna(support) else np.nan,
         "resistance": resistance,
-        "resistance_low": resistance - area,
-        "resistance_high": resistance + area,
-
+        "resistance_low": resistance - area if pd.notna(resistance) else np.nan,
+        "resistance_high": resistance + area if pd.notna(resistance) else np.nan,
         "atr": atr_now
     }
 
@@ -1365,140 +1439,106 @@ def hitung_tp_sl(
 
 
 # =========================================================
-# BACKTEST
-# =========================================================
 
-def jalankan_backtest(
-    df,
-    threshold
-):
-
-    data = df.copy()
-
-    data["SIGNAL_BACKTEST"] = np.where(
-        data["SCORE_HISTORIS"] >= threshold,
-        "BUY",
-        "WAIT"
-    )
-
-    data["RETURN_STRATEGI"] = np.where(
-
-        (
-            data["SIGNAL_BACKTEST"] ==
-            "BUY"
-        )
-        &
-        data["RETURN_BESOK"].notna(),
-
-        data["RETURN_BESOK"],
-
-        0.0
-    )
-
-    data["RETURN_STRATEGI"] = (
-        data["RETURN_STRATEGI"]
-        .fillna(0)
-    )
-
-    data["EQUITY_CURVE"] = (
-        1 + data["RETURN_STRATEGI"]
-    ).cumprod()
-
-    if data.empty:
-
+    def _normalize_backtest_result(r):
+        """Normalize old/new backtest key names for the compact UI."""
+        if not isinstance(r, dict):
+            return {}
         return {
-            "THRESHOLD": threshold,
-            "JUMLAH_TRADE": 0,
-            "WIN_RATE": 0,
-            "AVG_RETURN": 0,
-            "TOTAL_RETURN": 0,
-            "MAX_DRAWDOWN": 0,
-            "PROFIT_FACTOR": 0,
-            "DATA": data
+            "threshold": r.get("THRESHOLD", r.get("threshold", np.nan)),
+            "trades": r.get("TRADES", r.get("trades", np.nan)),
+            "win_rate": r.get("WIN_RATE", r.get("win_rate", np.nan)),
+            "avg_return": r.get("AVG_RETURN", r.get("avg_return", np.nan)),
+            "total_return": r.get("TOTAL_RETURN", r.get("total_return", np.nan)),
+            "max_drawdown": r.get("MAX_DRAWDOWN", r.get("max_drawdown", np.nan)),
+            "profit_factor": r.get("PROFIT_FACTOR", r.get("profit_factor", np.nan)),
         }
 
-    total_return = (
-        data["EQUITY_CURVE"].iloc[-1] - 1
+    # =====================================================
+    # 🧪 BACKTEST PERFORMANCE — COMPACT VIEW
+    # =====================================================
+    st.subheader("🧪 BACKTEST PERFORMANCE")
+
+    # Backtest remains available as historical validation, but the long
+    # threshold-by-threshold table is intentionally hidden.
+    _bt_total_trade = locals().get(
+        "total_trades",
+        locals().get("n_trades", locals().get("trade_count", np.nan))
+    )
+    _bt_win_rate = locals().get(
+        "win_rate",
+        locals().get("selected_win_rate", np.nan)
+    )
+    _bt_avg_return = locals().get(
+        "avg_return",
+        locals().get("selected_avg_return", np.nan)
+    )
+    _bt_total_return = locals().get(
+        "total_return",
+        locals().get("selected_total_return", np.nan)
+    )
+    _bt_max_dd = locals().get(
+        "max_drawdown",
+        locals().get("max_dd", locals().get("selected_max_drawdown", np.nan))
+    )
+    _bt_profit_factor = locals().get(
+        "profit_factor",
+        locals().get("selected_profit_factor", np.nan)
     )
 
-    trades = data[
-        (
-            data["SIGNAL_BACKTEST"] ==
-            "BUY"
+    def _bt_num(x):
+        try:
+            x = float(x)
+            return x if np.isfinite(x) else np.nan
+        except Exception:
+            return np.nan
+
+    def _bt_pct(x):
+        x = _bt_num(x)
+        if pd.isna(x):
+            return "N/A"
+        # Accept either decimal (0.12) or percentage (12).
+        return f"{x * 100:.2f}%" if abs(x) <= 2 else f"{x:.2f}%"
+
+    def _bt_count(x):
+        x = _bt_num(x)
+        return "N/A" if pd.isna(x) else f"{int(round(x)):,}"
+
+    def _bt_pf(x):
+        x = _bt_num(x)
+        return "N/A" if pd.isna(x) else f"{x:.2f}"
+
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    c1.metric("Total Trade", _bt_count(_bt_total_trade))
+    c2.metric("Win Rate", _bt_pct(_bt_win_rate))
+    c3.metric("Avg Return/Trade", _bt_pct(_bt_avg_return))
+    c4.metric("Total Return", _bt_pct(_bt_total_return))
+    c5.metric("Max Drawdown", _bt_pct(_bt_max_dd))
+    c6.metric("Profit Factor", _bt_pf(_bt_profit_factor))
+
+    _pf = _bt_num(_bt_profit_factor)
+    _tr = _bt_num(_bt_total_return)
+
+    if pd.notna(_pf) and _pf > 1 and pd.notna(_tr) and _tr > 0:
+        st.success(
+            "🟢 **Backtest cukup positif** — profit factor > 1 dan "
+            "total return historis positif. Hasil historis bukan jaminan "
+            "performa di masa depan."
         )
-        &
-        data["RETURN_BESOK"].notna()
-    ]
-
-    jumlah_trade = len(
-        trades
-    )
-
-    if jumlah_trade:
-
-        win_rate = (
-            trades["RETURN_BESOK"] > 0
-        ).mean()
-
-        avg_return = (
-            trades["RETURN_BESOK"].mean()
+    elif pd.notna(_pf) and _pf > 1:
+        st.info(
+            "🟡 **Backtest masih perlu dicermati** — profit factor > 1, "
+            "tetapi hasil historis belum menunjukkan keunggulan yang kuat."
         )
-
     else:
-
-        win_rate = 0
-        avg_return = 0
-
-    equity = data[
-        "EQUITY_CURVE"
-    ]
-
-    running_max = equity.cummax()
-
-    drawdown = (
-        equity / running_max - 1
-    )
-
-    max_drawdown = drawdown.min()
-
-    profit = trades.loc[
-        trades["RETURN_BESOK"] > 0,
-        "RETURN_BESOK"
-    ].sum()
-
-    loss = abs(
-        trades.loc[
-            trades["RETURN_BESOK"] < 0,
-            "RETURN_BESOK"
-        ].sum()
-    )
-
-    if loss > 0:
-
-        profit_factor = (
-            profit / loss
+        st.warning(
+            "⚠️ **Backtest belum menunjukkan keunggulan yang kuat.** "
+            "Gunakan sebagai informasi historis, bukan jaminan hasil."
         )
 
-    elif profit > 0:
-
-        profit_factor = np.inf
-
-    else:
-
-        profit_factor = 0
-
-    return {
-
-        "THRESHOLD": threshold,
-        "JUMLAH_TRADE": jumlah_trade,
-        "WIN_RATE": win_rate,
-        "AVG_RETURN": avg_return,
-        "TOTAL_RETURN": total_return,
-        "MAX_DRAWDOWN": max_drawdown,
-        "PROFIT_FACTOR": profit_factor,
-        "DATA": data
-    }
-
+    st.caption(
+        "Tabel threshold detail disembunyikan agar tampilan tetap ringkas."
+    )
 
 # =========================================================
 # REGRESSION
@@ -2883,286 +2923,1228 @@ def calculate_similarity(
 
 
 # =========================================================
-# BROKER / BANDAR FLOW
+# SUPPORT / RESISTANCE INTELLIGENCE + MARKET NEWS
 # =========================================================
 
-def _get_secret_value(name):
-    """Read a Streamlit secret first, then an environment variable."""
+def _safe_float(value):
     try:
-        value = st.secrets.get(name, "")
-        if value:
-            return str(value).strip()
+        x = float(value)
+        return x if np.isfinite(x) else np.nan
     except Exception:
-        pass
-    return os.getenv(name, "").strip()
+        return np.nan
 
 
-@st.cache_data(ttl=1800, show_spinner=False)
-def fetch_broker_summary_day(ticker, trade_date, investor="all", market="RG"):
-    """Fetch one completed trading day's broker summary.
-
-    Index Alpha returns one row per broker. A single-day request is used
-    intentionally because multi-day requests are aggregated by broker.
-    """
-    api_key = _get_secret_value("INDEX_ALPHA_API_KEY")
-    if not api_key:
+def _ohlcv_clean(data):
+    """Normalize OHLCV columns and remove invalid rows."""
+    if data is None or data.empty:
         return pd.DataFrame()
 
-    url = "https://api.indexalpha.id/stocks/broker-summary"
-    params = {
-        "ticker": ticker.replace(".JK", "").upper(),
-        "from": str(trade_date),
-        "to": str(trade_date),
-        "investor": investor,
-        "market": market,
-    }
-    headers = {
-        "accept": "application/json",
-        "Authorization": f"Bearer {api_key}",
-    }
+    df = data.copy()
 
-    try:
-        r = requests.get(url, params=params, headers=headers, timeout=20)
-        if r.status_code != 200:
-            return pd.DataFrame()
-        payload = r.json()
-        rows = payload.get("data", []) if isinstance(payload, dict) else []
-        if not rows:
-            return pd.DataFrame()
-
-        df = pd.DataFrame(rows)
-        numeric_cols = [
-            "buy_freq", "buy_volume", "buy_value",
-            "sell_freq", "sell_volume", "sell_value",
-            "buy_avg", "sell_avg",
+    # Handle possible MultiIndex columns from yfinance.
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = [
+            str(c[0]) if isinstance(c, tuple) else str(c)
+            for c in df.columns
         ]
-        for col in numeric_cols:
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
 
-        df["broker"] = df["code"].astype(str).str.upper()
-        df["net_value"] = df["buy_value"] - df["sell_value"]
-        df["net_volume"] = df["buy_volume"] - df["sell_volume"]
-        df["date"] = pd.Timestamp(trade_date)
-        return df
-    except Exception:
+    required = ["Open", "High", "Low", "Close"]
+    if not all(c in df.columns for c in required):
         return pd.DataFrame()
 
+    for c in required + (["Volume"] if "Volume" in df.columns else []):
+        df[c] = pd.to_numeric(df[c], errors="coerce")
 
-@st.cache_data(ttl=1800, show_spinner=False)
-def fetch_broker_flow_range(ticker, dates, investor="all", market="RG"):
-    """Fetch daily broker summaries for a list of trading dates."""
-    dates = [pd.Timestamp(x).date() for x in dates]
-    if not dates:
-        return pd.DataFrame()
+    if "Date" in df.columns:
+        df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+    elif isinstance(df.index, pd.DatetimeIndex):
+        df = df.reset_index()
+        df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+    else:
+        df["Date"] = pd.to_datetime(df.index, errors="coerce")
 
-    # Parallel requests make a 60-day window practical while respecting
-    # normal API rate limits. Individual calls are cached above.
-    frames = []
-    max_workers = min(6, max(1, len(dates)))
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {
-            executor.submit(fetch_broker_summary_day, ticker, d, investor, market): d
-            for d in dates
-        }
-        for future in as_completed(futures):
-            try:
-                result = future.result()
-                if not result.empty:
-                    frames.append(result)
-            except Exception:
-                continue
+    df = (
+        df.dropna(subset=["Date", "Open", "High", "Low", "Close"])
+          .sort_values("Date")
+          .drop_duplicates("Date")
+          .reset_index(drop=True)
+    )
 
-    if not frames:
-        return pd.DataFrame()
+    return df
+
+
+def _cluster_price_levels(levels, tolerance_pct=0.008):
+    """
+    Merge nearby pivot levels into zones.
+    Returns representative price levels.
+    """
+    vals = sorted(
+        float(x) for x in levels
+        if x is not None and np.isfinite(x) and x > 0
+    )
+
+    if not vals:
+        return []
+
+    clusters = [[vals[0]]]
+
+    for price in vals[1:]:
+        center = float(np.mean(clusters[-1]))
+        if abs(price - center) / center <= tolerance_pct:
+            clusters[-1].append(price)
+        else:
+            clusters.append([price])
+
+    return [float(np.mean(c)) for c in clusters]
+
+
+def calculate_sr_levels(data, pivot_window=3, lookback=120):
+    """
+    Practical support/resistance.
+
+    Priority is given to recent swing structure and recent rolling levels.
+    A very old/very distant low such as 121 is NOT allowed to become
+    "Support Terdekat" when price is much higher.  If no realistic nearby
+    support exists, the result is intentionally empty (N/A) rather than
+    presenting a misleading distant level.
+    """
+    df = _ohlcv_clean(data)
+    if df.empty or len(df) < max(30, pivot_window * 4):
+        return {"support": [], "resistance": [], "all_levels": []}
+
+    work = df.tail(int(lookback)).copy().reset_index(drop=True)
+    w = int(max(2, pivot_window))
+    current = float(work["Close"].iloc[-1])
+
+    highs = work["High"]
+    lows = work["Low"]
+
+    swing_high = (
+        (highs == highs.rolling(2 * w + 1, center=True).max())
+        & highs.notna()
+    )
+    swing_low = (
+        (lows == lows.rolling(2 * w + 1, center=True).min())
+        & lows.notna()
+    )
+
+    resistance_raw = highs[swing_high].tolist()
+    support_raw = lows[swing_low].tolist()
+
+    # Recent levels are deliberately weighted more heavily than old extremes.
+    for n in (10, 20, 40, 60):
+        if len(work) >= n:
+            resistance_raw.append(float(work["High"].tail(n).max()))
+            support_raw.append(float(work["Low"].tail(n).min()))
+
+    resistance = _cluster_price_levels(resistance_raw)
+    support = _cluster_price_levels(support_raw)
+
+    # ATR gives a volatility-aware definition of "nearby".
+    atr = _atr_value(work, 14)
+    atr_pct = atr / current if pd.notna(atr) and current > 0 else np.nan
+
+    # Never call a level 25-40% away "nearest" just because it is the
+    # closest historical swing.  Use the tighter of 15% and 4 ATR when ATR
+    # is available, with a minimum 5% practical zone.
+    if pd.notna(atr_pct) and atr_pct > 0:
+        max_relevant_pct = min(0.15, max(0.05, 4.0 * atr_pct))
+    else:
+        max_relevant_pct = 0.15
+
+    supports = sorted(
+        [x for x in support if x < current],
+        key=lambda x: current - x
+    )
+    resistances = sorted(
+        [x for x in resistance if x > current],
+        key=lambda x: x - current
+    )
+
+    relevant_supports = [
+        x for x in supports
+        if (current - x) / current <= max_relevant_pct
+    ]
+    relevant_resistances = [
+        x for x in resistances
+        if (x - current) / current <= max_relevant_pct
+    ]
+
+    return {
+        "support": relevant_supports[:3],
+        "resistance": relevant_resistances[:3],
+        "all_levels": sorted(
+            set(relevant_supports[:3] + relevant_resistances[:3])
+        )
+    }
+
+def _volume_ratio(df, window=20):
+    if "Volume" not in df.columns:
+        return np.nan
+
+    vol = pd.to_numeric(df["Volume"], errors="coerce")
+    if len(vol) < window:
+        return np.nan
+
+    base = vol.iloc[:-1].tail(window).mean()
+    current = vol.iloc[-1]
+
+    if pd.isna(base) or base <= 0:
+        return np.nan
+
+    return float(current / base)
+
+
+def _atr_value(df, window=14):
+    if len(df) < window + 1:
+        return np.nan
+
+    prev_close = df["Close"].shift(1)
+
+    tr = pd.concat(
+        [
+            df["High"] - df["Low"],
+            (df["High"] - prev_close).abs(),
+            (df["Low"] - prev_close).abs()
+        ],
+        axis=1
+    ).max(axis=1)
+
+    value = tr.rolling(window).mean().iloc[-1]
+    return _safe_float(value)
+
+
+def _wick_stats(row):
+    high = float(row["High"])
+    low = float(row["Low"])
+    open_ = float(row["Open"])
+    close = float(row["Close"])
+
+    rng = high - low
+
+    if rng <= 0:
+        return 0.0, 0.0, 0.0
+
+    upper = (high - max(open_, close)) / rng
+    lower = (min(open_, close) - low) / rng
+    body = abs(close - open_) / rng
+
+    return float(upper), float(lower), float(body)
+
+
+def _trend_state(df):
+    close = df["Close"]
+
+    ma20 = close.rolling(20).mean().iloc[-1] if len(df) >= 20 else np.nan
+    ma50 = close.rolling(50).mean().iloc[-1] if len(df) >= 50 else np.nan
+    ma200 = close.rolling(200).mean().iloc[-1] if len(df) >= 200 else np.nan
+    price = float(close.iloc[-1])
+
+    if pd.notna(ma200):
+        if price > ma20 > ma50 > ma200:
+            state = "BULLISH"
+        elif price < ma20 < ma50 < ma200:
+            state = "BEARISH"
+        else:
+            state = "MIXED"
+    elif pd.notna(ma50):
+        if price > ma20 > ma50:
+            state = "BULLISH"
+        elif price < ma20 < ma50:
+            state = "BEARISH"
+        else:
+            state = "MIXED"
+    else:
+        state = "BULLISH" if price > ma20 else "BEARISH"
+
+    return {
+        "state": state,
+        "ma20": _safe_float(ma20),
+        "ma50": _safe_float(ma50),
+        "ma200": _safe_float(ma200)
+    }
+
+
+def _score_breakout(volume_ratio, body_ratio, trend, atr_move):
+    score = 0
+
+    if pd.notna(volume_ratio):
+        if volume_ratio >= 1.5:
+            score += 25
+        elif volume_ratio >= 1.2:
+            score += 15
+
+    if body_ratio >= 0.55:
+        score += 20
+    elif body_ratio >= 0.35:
+        score += 10
+
+    if trend == "BULLISH":
+        score += 20
+    elif trend == "MIXED":
+        score += 10
+
+    if pd.notna(atr_move):
+        if atr_move >= 1.5:
+            score += 20
+        elif atr_move >= 1.0:
+            score += 10
+
+    # Close above the level is handled separately as 35 points.
+    return min(65, score)
+
+
+def analyze_support_resistance(data, lookback=120):
+    """
+    Classify the latest candle:
+    APPROACHING / TESTING / REJECTION / BREAKOUT / BREAKDOWN.
+    """
+    df = _ohlcv_clean(data)
+
+    if df.empty or len(df) < 30:
+        return None
+
+    levels = calculate_sr_levels(df, lookback=lookback)
+
+    last = df.iloc[-1]
+    close = float(last["Close"])
+    high = float(last["High"])
+    low = float(last["Low"])
+
+    upper_wick, lower_wick, body_ratio = _wick_stats(last)
+    vol_ratio = _volume_ratio(df, 20)
+    atr = _atr_value(df, 14)
+    trend = _trend_state(df)
+
+    support = levels["support"][0] if levels["support"] else np.nan
+    support2 = levels["support"][1] if len(levels["support"]) > 1 else np.nan
+    resistance = levels["resistance"][0] if levels["resistance"] else np.nan
+    resistance2 = levels["resistance"][1] if len(levels["resistance"]) > 1 else np.nan
+
+    # Normalize the "test zone" to 1% or 0.5 ATR, whichever is wider.
+    atr_pct = (atr / close) if pd.notna(atr) and close else 0
+    test_threshold = max(0.01, atr_pct * 0.5)
+
+    support_dist = (
+        abs(close - support) / support
+        if pd.notna(support) and support
+        else np.nan
+    )
+    resistance_dist = (
+        abs(resistance - close) / resistance
+        if pd.notna(resistance) and resistance
+        else np.nan
+    )
+
+    # Breakout / breakdown is based on close, not intraday wick.
+    breakout = (
+        pd.notna(resistance)
+        and close > resistance
+    )
+
+    breakdown = (
+        pd.notna(support)
+        and close < support
+    )
+
+    resistance_test = (
+        pd.notna(resistance)
+        and resistance_dist <= test_threshold
+        and not breakout
+    )
+
+    support_test = (
+        pd.notna(support)
+        and support_dist <= test_threshold
+        and not breakdown
+    )
+
+    # Rejection = price touched the level but closed back on the safe side.
+    resistance_rejection = (
+        pd.notna(resistance)
+        and high >= resistance
+        and close < resistance
+        and upper_wick >= 0.30
+    )
+
+    support_rejection = (
+        pd.notna(support)
+        and low <= support
+        and close > support
+        and lower_wick >= 0.30
+    )
+
+    if breakout:
+        status = "BREAKOUT"
+        active_level = resistance
+        direction = "bullish"
+    elif breakdown:
+        status = "BREAKDOWN"
+        active_level = support
+        direction = "bearish"
+    elif resistance_rejection:
+        status = "RESISTANCE REJECTION"
+        active_level = resistance
+        direction = "bearish"
+    elif support_rejection:
+        status = "SUPPORT REJECTION"
+        active_level = support
+        direction = "bullish"
+    elif resistance_test:
+        status = "TESTING RESISTANCE"
+        active_level = resistance
+        direction = "neutral"
+    elif support_test:
+        status = "TESTING SUPPORT"
+        active_level = support
+        direction = "neutral"
+    elif pd.notna(resistance) and resistance_dist <= 0.02:
+        status = "APPROACHING RESISTANCE"
+        active_level = resistance
+        direction = "neutral"
+    elif pd.notna(support) and support_dist <= 0.02:
+        status = "APPROACHING SUPPORT"
+        active_level = support
+        direction = "neutral"
+    else:
+        status = "BETWEEN LEVELS"
+        active_level = np.nan
+        direction = "neutral"
+
+    atr_move = (
+        abs(close - active_level) / atr
+        if pd.notna(active_level) and pd.notna(atr) and atr > 0
+        else np.nan
+    )
+
+    breakout_score = 0
+    breakdown_score = 0
+
+    if breakout and pd.notna(resistance):
+        breakout_score = 35 + _score_breakout(
+            vol_ratio, body_ratio, trend["state"], atr_move
+        )
+
+    if breakdown and pd.notna(support):
+        breakdown_score = 35 + _score_breakout(
+            vol_ratio, body_ratio, trend["state"], atr_move
+        )
+
+    breakout_score = min(100, int(round(breakout_score)))
+    breakdown_score = min(100, int(round(breakdown_score)))
+
+    # Future scenario targets.
+    bullish_target = resistance2
+    bearish_target = support2
+
+    if status in ["TESTING RESISTANCE", "APPROACHING RESISTANCE"]:
+        bullish_target = resistance2
+    elif status == "BREAKOUT":
+        bullish_target = resistance2
+
+    if status in ["TESTING SUPPORT", "APPROACHING SUPPORT"]:
+        bearish_target = support2
+    elif status == "BREAKDOWN":
+        bearish_target = support2
+
+    return {
+        "date": last["Date"],
+        "price": close,
+        "high": high,
+        "low": low,
+        "support": support,
+        "support2": support2,
+        "resistance": resistance,
+        "resistance2": resistance2,
+        "support_dist_pct": support_dist * 100 if pd.notna(support_dist) else np.nan,
+        "resistance_dist_pct": resistance_dist * 100 if pd.notna(resistance_dist) else np.nan,
+        "upper_wick_pct": upper_wick * 100,
+        "lower_wick_pct": lower_wick * 100,
+        "body_pct": body_ratio * 100,
+        "volume_ratio": vol_ratio,
+        "atr": atr,
+        "atr_move": atr_move,
+        "trend": trend,
+        "status": status,
+        "direction": direction,
+        "breakout_score": breakout_score,
+        "breakdown_score": breakdown_score,
+        "bullish_target": bullish_target,
+        "bearish_target": bearish_target,
+    }
+
+
+def _fmt_price(x):
+    if pd.isna(x):
+        return "N/A"
+    return f"{x:,.2f}"
+
+
+def _fmt_pct(x):
+    if pd.isna(x):
+        return "N/A"
+    return f"{x:.2f}%"
+
+
+def _fmt_x(x):
+    if pd.isna(x):
+        return "N/A"
+    return f"{x:.2f}×"
+
+
+def _sr_commentary(info, ticker):
+    if info is None:
+        return (
+            f"Data {ticker} belum cukup untuk menentukan "
+            "support/resistance otomatis."
+        )
+
+    status = info["status"]
+    price = info["price"]
+    support = info["support"]
+    support2 = info["support2"]
+    resistance = info["resistance"]
+    resistance2 = info["resistance2"]
+    vr = info["volume_ratio"]
+    trend = info["trend"]["state"]
+
+    if status == "BREAKOUT":
+        target = info["bullish_target"]
+        score = info["breakout_score"]
+
+        text = (
+            f"🟢 **{ticker} mengalami breakout** dari resistance "
+            f"**{_fmt_price(resistance)}**. Harga ditutup di "
+            f"**{_fmt_price(price)}**."
+        )
+
+        if pd.notna(vr):
+            text += f" Volume berada di **{vr:.2f}× MA20**."
+
+        text += (
+            f" Trend saat ini **{trend}**. "
+            f"Breakout score **{score}/100**."
+        )
+
+        text += (
+            " Breakout lebih meyakinkan apabila candle berikutnya "
+            "mampu bertahan di atas level breakout."
+        )
+
+        return text
+
+    if status == "BREAKDOWN":
+        target = info["bearish_target"]
+        score = info["breakdown_score"]
+
+        text = (
+            f"🔴 **{ticker} mengalami breakdown** dari support "
+            f"**{_fmt_price(support)}**. Harga ditutup di "
+            f"**{_fmt_price(price)}**."
+        )
+
+        if pd.notna(vr):
+            text += f" Volume berada di **{vr:.2f}× MA20**."
+
+        text += (
+            f" Trend saat ini **{trend}**. "
+            f"Breakdown score **{score}/100**."
+        )
+
+        text += (
+            " Breakdown lebih meyakinkan apabila candle berikutnya "
+            "gagal kembali di atas level breakdown."
+        )
+
+        return text
+
+    if status == "RESISTANCE REJECTION":
+        text = (
+            f"🔴 **{ticker} mengalami rejection di resistance "
+            f"{_fmt_price(resistance)}**. Harga sempat mencapai "
+            f"**{_fmt_price(info['high'])}**, tetapi ditutup kembali "
+            f"di **{_fmt_price(price)}**."
+        )
+
+        if pd.notna(vr):
+            text += f" Volume {vr:.2f}× MA20."
+
+        if pd.notna(support):
+            text += (
+                f" Jika tekanan jual berlanjut, support terdekat "
+                f"berada di **{_fmt_price(support)}**."
+            )
+
+        return text
+
+    if status == "SUPPORT REJECTION":
+        text = (
+            f"🟢 **{ticker} berhasil mempertahankan support "
+            f"{_fmt_price(support)}**. Harga sempat turun ke "
+            f"**{_fmt_price(info['low'])}**, tetapi ditutup kembali "
+            f"di **{_fmt_price(price)}**."
+        )
+
+        if pd.notna(vr):
+            text += f" Volume {vr:.2f}× MA20."
+
+        if pd.notna(resistance):
+            text += (
+                f" Jika rebound berlanjut, resistance terdekat "
+                f"berada di **{_fmt_price(resistance)}**."
+            )
+
+        return text
+
+    if status == "TESTING RESISTANCE":
+        text = (
+            f"🔴 **{ticker} sedang menguji resistance "
+            f"{_fmt_price(resistance)}**. Harga berada "
+            f"{_fmt_pct(info['resistance_dist_pct'])} dari level tersebut."
+        )
+
+        if pd.notna(vr):
+            text += f" Volume saat ini {vr:.2f}× MA20."
+
+        text += (
+            " Breakout belum dianggap terkonfirmasi hanya karena "
+            "high menembus level."
+        )
+
+        if pd.notna(resistance):
+            text += (
+                f" Skenario bullish: daily close di atas "
+                f"**{_fmt_price(resistance)}**, volume ideal "
+                f"≥ **1,5× MA20**, lalu harga mampu bertahan di atas "
+                "level tersebut."
+            )
+
+        return text
+
+    if status == "TESTING SUPPORT":
+        text = (
+            f"🟢 **{ticker} sedang menguji support "
+            f"{_fmt_price(support)}**. Harga berada "
+            f"{_fmt_pct(info['support_dist_pct'])} dari level tersebut."
+        )
+
+        if pd.notna(vr):
+            text += f" Volume saat ini {vr:.2f}× MA20."
+
+        text += (
+            " Breakdown belum dianggap terkonfirmasi hanya karena "
+            "low menembus level."
+        )
+
+        if pd.notna(support):
+            text += (
+                f" Skenario bearish: daily close di bawah "
+                f"**{_fmt_price(support)}**, volume ideal "
+                f"≥ **1,5× MA20**, lalu harga gagal kembali di atas "
+                "level tersebut."
+            )
+
+        return text
 
     return (
-        pd.concat(frames, ignore_index=True)
-        .sort_values(["date", "net_value"], ascending=[True, False])
-        .reset_index(drop=True)
+        f"⚪ **{ticker} berada di antara level support dan resistance utama.** "
+        f"Trend saat ini **{trend}**. Belum ada pengujian level yang cukup dekat."
     )
 
 
-def build_daily_broker_flow_summary(flow_df):
-    """Create one row per date showing the leading 3 accumulators/distributors."""
-    if flow_df.empty:
-        return pd.DataFrame()
+@st.cache_data(ttl=900, show_spinner=False)
+def fetch_google_news_rss(query, limit=8):
+    """Google News RSS; no API key required."""
+    try:
+        url = (
+            "https://news.google.com/rss/search?"
+            f"q={quote_plus(str(query))}"
+            "&hl=id&gl=ID&ceid=ID:id"
+        )
 
-    rows = []
-    for dt, g in flow_df.groupby("date", sort=True):
-        g = g.copy()
-        acc = g[g["net_value"] > 0].sort_values("net_value", ascending=False).head(3)
-        dist = g[g["net_value"] < 0].sort_values("net_value", ascending=True).head(3)
+        r = requests.get(
+            url,
+            timeout=15,
+            headers={"User-Agent": "Mozilla/5.0"}
+        )
 
-        acc_text = " • ".join(
-            f"{r.broker} ({r.net_value/1e9:+.2f}B)"
-            for r in acc.itertuples()
-        ) or "-"
-        dist_text = " • ".join(
-            f"{r.broker} ({abs(r.net_value)/1e9:.2f}B)"
-            for r in dist.itertuples()
-        ) or "-"
+        if r.status_code != 200:
+            return []
 
-        rows.append({
-            "Tanggal": pd.Timestamp(dt).strftime("%d-%m-%Y"),
-            "Top 3 Akumulasi": acc_text,
-            "Top 3 Distribusi": dist_text,
-        })
+        root = ET.fromstring(r.content)
+        rows = []
 
-    return pd.DataFrame(rows)
+        for item in root.findall(".//item"):
+            title = item.findtext("title", "").strip()
+            link = item.findtext("link", "").strip()
+            pub_date = item.findtext("pubDate", "").strip()
+            source = item.findtext("source", "").strip()
+
+            if title:
+                rows.append({
+                    "title": title,
+                    "link": link,
+                    "date": pub_date,
+                    "source": source
+                })
+
+            if len(rows) >= limit:
+                break
+
+        return rows
+
+    except Exception:
+        return []
 
 
-def render_broker_flow_module(ticker, stock_data, end_date, broker_window=60):
-    """Render broker/bandar movement replacing stock-vs-IHSG/similar stocks."""
+def _unique_news(items, limit=8):
+    seen = set()
+    out = []
+
+    for item in items:
+        title = item.get("title", "").strip()
+
+        if not title or title in seen:
+            continue
+
+        seen.add(title)
+        out.append(item)
+
+        if len(out) >= limit:
+            break
+
+    return out
+
+
+def _classify_news_title(title):
+    """
+    Indicative headline classification.
+    This is a headline-level filter, not a price prediction.
+    """
+    title_l = str(title or "").lower()
+
+    positive = [
+        "naik", "menguat", "positif", "bullish", "tumbuh",
+        "meningkat", "laba", "profit", "upgrade", "rebound",
+        "rekor", "optimis", "buy", "dividen", "kontrak",
+        "akuisisi", "ekspansi", "surplus", "pendapatan naik",
+        "laba naik", "kinerja positif"
+    ]
+
+    negative = [
+        "turun", "melemah", "negatif", "bearish", "rugi",
+        "loss", "downgrade", "risiko", "anjlok", "jatuh",
+        "tekanan", "krisis", "sell", "utang", "defisit",
+        "sanksi", "gagal bayar", "laba turun", "pendapatan turun",
+        "kinerja buruk", "denda"
+    ]
+
+    pos_score = sum(1 for word in positive if word in title_l)
+    neg_score = sum(1 for word in negative if word in title_l)
+
+    if pos_score > neg_score:
+        return "KATALIS POSITIF", "🚀"
+    if neg_score > pos_score:
+        return "WARNING", "⚠️"
+    return "NETRAL", "⚪"
+
+
+def _render_news_items(items, max_items=6):
+    """Compact, readable news cards using native Streamlit."""
+    if not items:
+        st.caption("Belum ditemukan berita yang relevan.")
+        return
+
+    for item in items[:max_items]:
+        title = str(item.get("title", "Berita")).strip()
+        link = str(item.get("link", "#")).strip()
+        source = str(item.get("source", "")).strip()
+        pub_date = str(item.get("date", "")).strip()
+
+        label, icon = _classify_news_title(title)
+
+        if label == "KATALIS POSITIF":
+            note = "Potensi dukungan harga."
+        elif label == "WARNING":
+            note = "Potensi tekanan harga."
+        else:
+            note = "Dampak belum jelas."
+
+        meta = " • ".join(x for x in [source, pub_date] if x)
+
+        with st.container(border=True):
+            st.markdown(f"**{icon} {label}**")
+            st.markdown(f"[{title}]({link})")
+            if meta:
+                st.caption(meta)
+            st.caption(note)
+
+def _news_sentiment(items):
+    positive = [
+        "naik", "menguat", "positif", "bullish", "tumbuh",
+        "meningkat", "laba", "profit", "upgrade", "rebound",
+        "rekor", "optimis", "buy"
+    ]
+
+    negative = [
+        "turun", "melemah", "negatif", "bearish", "rugi",
+        "loss", "downgrade", "risiko", "anjlok", "jatuh",
+        "tekanan", "krisis", "sell"
+    ]
+
+    score = 0
+
+    for item in items:
+        title = item.get("title", "").lower()
+
+        score += sum(1 for word in positive if word in title)
+        score -= sum(1 for word in negative if word in title)
+
+    if score >= 3:
+        return "POSITIF", score
+    if score <= -3:
+        return "NEGATIF", score
+    return "NETRAL", score
+
+
+def render_support_resistance_news_module(
+    ticker,
+    stock_data,
+    sektor="-",
+    lookback=120
+):
+    """
+    Combined intelligence panel:
+    automatic S/R + volume + candle + ATR + trend + scenarios + news.
+    """
     st.divider()
-    st.subheader("🏦 PERGERAKAN BANDAR / BROKER FLOW")
-    st.caption(
-        "Akumulasi = net buy broker; distribusi = net sell broker. "
-        "Kode broker menunjukkan broker transaksi, bukan identitas investor akhir."
+    st.subheader("🎯 SUPPORT & RESISTANCE INTELLIGENCE")
+
+    info = analyze_support_resistance(
+        stock_data,
+        lookback=lookback
     )
 
-    api_key = _get_secret_value("INDEX_ALPHA_API_KEY")
-    if not api_key:
+    if info is None:
         st.warning(
-            "Data broker belum aktif. Tambahkan `INDEX_ALPHA_API_KEY` ke "
-            "Streamlit Secrets agar kode broker, akumulasi, dan distribusi harian "
-            "dapat ditampilkan."
+            f"Data {ticker} belum cukup untuk menghitung "
+            "Support & Resistance Intelligence."
+        )
+        return
+
+    # -----------------------------------------------------
+    # STATUS
+    # -----------------------------------------------------
+
+    status = info["status"]
+
+    status_icon = {
+        "BREAKOUT": "🟢",
+        "BREAKDOWN": "🔴",
+        "RESISTANCE REJECTION": "🔴",
+        "SUPPORT REJECTION": "🟢",
+        "TESTING RESISTANCE": "🔴",
+        "TESTING SUPPORT": "🟢",
+        "APPROACHING RESISTANCE": "🟡",
+        "APPROACHING SUPPORT": "🟡",
+        "BETWEEN LEVELS": "⚪"
+    }.get(status, "⚪")
+
+    st.markdown(
+        f"""
+        <div style="
+            border:1px solid #34404b;
+            border-radius:12px;
+            padding:16px;
+            margin-bottom:14px;
+            background:#101820;
+        ">
+            <div style="
+                color:#8b98a5;
+                font-size:11px;
+                letter-spacing:.08em;
+            ">
+                CURRENT PRICE ACTION
+            </div>
+            <div style="
+                font-size:26px;
+                font-weight:750;
+                margin-top:4px;
+            ">
+                {status_icon} {status}
+            </div>
+            <div style="
+                color:#9aa6b2;
+                font-size:12px;
+                margin-top:3px;
+            ">
+                {ticker} • {pd.Timestamp(info['date']).strftime('%d-%m-%Y')}
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+    # -----------------------------------------------------
+    # LEVEL CARDS
+    # -----------------------------------------------------
+
+    c1, c2 = st.columns(2)
+
+    # -----------------------------------------------------
+    # SUPPORT DISPLAY FALLBACK
+    # -----------------------------------------------------
+    # Support yang sangat jauh (misalnya low lama) sengaja tidak dipakai
+    # sebagai support terdekat. Agar kartu tidak N/A, gunakan SL1 sebagai
+    # support acuan relatif terhadap harga sekarang.
+    _display_support = info.get("support", np.nan)
+    _display_support_label = "Support Terdekat"
+
+    if pd.isna(_display_support) or _display_support >= info["price"]:
+        _display_atr = info.get("atr", np.nan)
+        if pd.notna(_display_atr) and _display_atr > 0:
+            _display_support = info["price"] - _display_atr
+        else:
+            _display_support = info["price"] * 0.97
+        _display_support_label = "SL1 / Support Acuan"
+
+    if pd.notna(_display_support) and info["price"] != 0:
+        _display_support_dist = (
+            (info["price"] - _display_support) / info["price"] * 100
+        )
+    else:
+        _display_support_dist = np.nan
+
+    c1.metric(
+        _display_support_label,
+        _fmt_price(_display_support),
+        (
+            f"-{_display_support_dist:.2f}%"
+            if pd.notna(_display_support_dist)
+            else None
+        )
+    )
+
+    c2.metric(
+        "Resistance Terdekat",
+        _fmt_price(info["resistance"]),
+        (
+            f"+{info['resistance_dist_pct']:.2f}%"
+            if pd.notna(info["resistance_dist_pct"])
+            else None
+        )
+    )
+
+    # -----------------------------------------------------
+    # MARKET FACTORS
+    # -----------------------------------------------------
+
+    st.markdown("### 📊 Konfirmasi Harga & Volume")
+
+    # Volume threshold:
+    # 1.5x MA20 is a practical "significant volume" threshold,
+    # NOT a bullish/bearish signal by itself.
+    vr = info["volume_ratio"]
+
+    if pd.isna(vr):
+        volume_label = "N/A"
+        volume_desc = "Volume belum cukup untuk dibandingkan dengan MA20."
+    elif vr < 1.0:
+        volume_label = "DI BAWAH NORMAL"
+        volume_desc = "Aktivitas transaksi berada di bawah rata-rata 20 candle."
+    elif vr < 1.2:
+        volume_label = "NORMAL"
+        volume_desc = "Aktivitas transaksi masih berada di sekitar normal."
+    elif vr < 1.5:
+        volume_label = "MULAI MENINGKAT"
+        volume_desc = "Aktivitas transaksi mulai lebih tinggi dari normal."
+    elif vr < 2.0:
+        volume_label = "SIGNIFIKAN"
+        volume_desc = "Volume ≥ 1,5× MA20; aktivitas transaksi meningkat signifikan."
+    else:
+        volume_label = "LONJAKAN TINGGI"
+        volume_desc = "Volume ≥ 2× MA20; aktivitas transaksi sangat tinggi."
+
+    st.markdown(
+        f"""
+        <div style="
+            border:1px solid #34404b;
+            border-radius:10px;
+            padding:12px 14px;
+            margin:4px 0 12px 0;
+            background:#101820;
+        ">
+            <b>Volume Status: {volume_label}</b><br>
+            <span style="color:#9aa6b2;font-size:12px;">
+                {volume_desc}
+            </span><br>
+            <span style="color:#9aa6b2;font-size:11px;">
+                Threshold volume signifikan = <b>1,5× MA20</b>.
+                Threshold ini hanya mengukur peningkatan aktivitas,
+                bukan sinyal BUY/SELL.
+            </span>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+    c1, c2, c3, c4, c5 = st.columns(5)
+
+    c1.metric(
+        "Volume Ratio",
+        _fmt_x(info["volume_ratio"])
+    )
+
+    c2.metric(
+        "Upper Wick",
+        _fmt_pct(info["upper_wick_pct"])
+    )
+
+    c3.metric(
+        "Lower Wick",
+        _fmt_pct(info["lower_wick_pct"])
+    )
+
+    c4.metric(
+        "ATR 14",
+        _fmt_price(info["atr"])
+    )
+
+    c5.metric(
+        "Trend",
+        info["trend"]["state"]
+    )
+
+    # -----------------------------------------------------
+    # SCORE
+    # -----------------------------------------------------
+
+    if status == "BREAKOUT":
+        st.markdown(
+            f"**Breakout Score: {info['breakout_score']}/100**"
+        )
+        st.progress(info["breakout_score"] / 100)
+
+    elif status == "BREAKDOWN":
+        st.markdown(
+            f"**Breakdown Score: {info['breakdown_score']}/100**"
+        )
+        st.progress(info["breakdown_score"] / 100)
+
+    # -----------------------------------------------------
+    # COMMENTARY
+    # -----------------------------------------------------
+
+    st.markdown("### 💡 Interpretasi Kondisi")
+
+    commentary = _sr_commentary(info, ticker)
+
+    if status in ["BREAKOUT", "SUPPORT REJECTION"]:
+        st.success(commentary)
+    elif status in [
+        "BREAKDOWN",
+        "RESISTANCE REJECTION"
+    ]:
+        st.error(commentary)
+    elif status in [
+        "TESTING RESISTANCE",
+        "TESTING SUPPORT"
+    ]:
+        st.warning(commentary)
+    else:
+        st.info(commentary)
+
+    # -----------------------------------------------------
+    # SCENARIO BOXES
+    # -----------------------------------------------------
+
+    st.markdown("### 🔮 Skenario Berikutnya")
+
+    s1, s2 = st.columns(2)
+
+    with s1:
+        target = info["resistance2"]
+
+        st.markdown(
+            f"""
+            <div style="
+                border:1px solid #34404b;
+                border-radius:10px;
+                padding:14px;
+                min-height:150px;
+            ">
+            <b>🟢 SKENARIO BULLISH</b><br><br>
+            Jika resistance <b>{_fmt_price(info['resistance'])}</b>
+            ditembus dengan daily close dan volume ideal
+            <b>≥ 1,5× MA20</b>, breakout menjadi lebih meyakinkan.
+            <br><br>
+            Fokus berikutnya: pantau apakah harga mampu
+            <b>bertahan di atas resistance</b>.
+            Level lanjutan tidak dipaksakan jika belum tersedia secara valid.
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+
+    with s2:
+        # =====================================================
+        # BEARISH LEVEL FALLBACK
+        # =====================================================
+        # Jangan tampilkan N/A hanya karena support berikutnya terlalu jauh.
+        # Prioritas:
+        #   1. support2 yang valid
+        #   2. support terdekat yang valid
+        #   3. SL1
+        #   4. jika SL1 juga tidak valid, gunakan harga - 1 ATR
+        # Dengan demikian level bearish tetap relevan terhadap harga sekarang.
+        _support_now = info.get("support", np.nan)
+        _support2_now = info.get("support2", np.nan)
+        _price_now = info.get("price", np.nan)
+        _atr_now = info.get("atr", np.nan)
+
+        # Ambil SL1 dari scope jika tersedia.
+        _sl1_now = locals().get("sl1", np.nan)
+
+        if pd.notna(_support2_now) and _support2_now < _price_now:
+            bearish_level = _support2_now
+            bearish_level_label = "support berikutnya"
+            bearish_condition_label = "support"
+        elif pd.notna(_support_now) and _support_now < _price_now:
+            bearish_level = _support_now
+            bearish_level_label = "support terdekat"
+            bearish_condition_label = "support"
+        else:
+            # Support valid tidak tersedia/terlalu jauh -> gunakan SL1.
+            if pd.isna(_sl1_now) or _sl1_now >= _price_now:
+                if pd.notna(_atr_now) and _atr_now > 0:
+                    _sl1_now = _price_now - _atr_now
+                else:
+                    _sl1_now = _price_now * 0.97
+
+            bearish_level = _sl1_now
+            bearish_level_label = "SL1 / support acuan"
+            bearish_condition_label = "SL1"
+
+        # Jarak level dari harga sekarang.
+        if pd.notna(_price_now) and pd.notna(bearish_level) and _price_now != 0:
+            _bearish_dist = (_price_now - bearish_level) / _price_now * 100
+        else:
+            _bearish_dist = np.nan
+
+        if bearish_condition_label == "support":
+            first_sentence = (
+                f"Jika support <b>{_fmt_price(_support_now)}</b> ditembus "
+                f"dengan daily close dan volume ideal <b>≥ 1,5× MA20</b>, "
+                "breakdown menjadi lebih meyakinkan."
+            )
+        else:
+            first_sentence = (
+                f"Jika harga turun menembus <b>SL1 {_fmt_price(bearish_level)}</b> "
+                f"dengan daily close dan volume ideal <b>≥ 1,5× MA20</b>, "
+                "tekanan bearish menjadi lebih meyakinkan."
+            )
+
+        distance_text = (
+            f" ({_bearish_dist:.2f}% di bawah harga)"
+            if pd.notna(_bearish_dist)
+            else ""
+        )
+
+        st.markdown(
+            f"""
+            <div style="
+                border:1px solid #34404b;
+                border-radius:10px;
+                padding:14px;
+                min-height:150px;
+            ">
+            <b>🔴 SKENARIO BEARISH</b><br><br>
+            {first_sentence}
+            <br><br>
+            Jika breakdown terkonfirmasi, fokus berikutnya:
+            <b>{bearish_level_label} {_fmt_price(bearish_level)}</b>{distance_text}.
+            Level ini digunakan sebagai acuan terdekat, bukan target pasti.
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+
+
+    st.caption(
+        "Support/resistance terdekat dipilih dari swing high/swing low yang "
+        "masih relevan terhadap harga saat ini dan disaring dengan ATR. "
+        "Level historis yang terlalu jauh tidak dipaksakan sebagai level terdekat. "
+        "Volume digunakan sebagai konfirmasi, bukan sebagai satu-satunya penentu."
+    )
+
+    # -----------------------------------------------------
+    # NEWS & COMMENTARY
+    # -----------------------------------------------------
+
+    st.markdown("## 📰 MARKET NEWS & COMMENTARY")
+    with st.expander("📰 MARKET NEWS & COMMENTARY — klik untuk buka/tutup", expanded=False):
+        st.caption(
+            "Berita berdasarkan saham, sektor, dan IHSG. "
+            "Label hanya indikatif, bukan sinyal BUY/SELL."
         )
         st.info(
-            "API broker yang digunakan menyediakan buy/sell value, volume, dan "
-            "average price per broker. Data historis tersedia mulai 1 Januari 2025."
-        )
-        return
-
-    # Use actual stock trading dates, then keep only the supported broker-data era.
-    dates = pd.to_datetime(stock_data["Date"], errors="coerce").dropna().dt.normalize().drop_duplicates().sort_values()
-    dates = dates[dates <= pd.Timestamp(end_date)]
-    dates = dates[dates >= pd.Timestamp("2025-01-01")]
-
-    if dates.empty:
-        st.info("Belum ada tanggal yang masuk periode data broker.")
-        return
-
-    # Window is deliberately configurable so 2/5/10-year seasonality does not
-    # trigger hundreds of broker API calls on every page load.
-    if broker_window > 0:
-        dates = dates.tail(int(broker_window))
-
-    with st.spinner(f"Mengambil broker flow {len(dates)} hari..."):
-        flow = fetch_broker_flow_range(ticker, dates.tolist())
-
-    if flow.empty:
-        st.error(
-            "Data broker tidak berhasil diambil. Periksa API key, kuota API, "
-            "atau tanggal perdagangan."
-        )
-        return
-
-    daily = build_daily_broker_flow_summary(flow)
-    end_dt = pd.Timestamp(end_date)
-    available_end = flow[flow["date"] <= end_dt]["date"].max()
-    end_flow = flow[flow["date"] == available_end].copy()
-
-    # Top 3 on the selected end date.
-    top_acc = end_flow.sort_values("net_value", ascending=False).head(3).copy()
-    top_dist = end_flow.sort_values("net_value", ascending=True).head(3).copy()
-
-    c1, c2 = st.columns(2, gap="medium")
-
-    with c1:
-        st.markdown("### 🟢 Top 3 Akumulasi")
-        acc_show = top_acc[["broker", "buy_value", "sell_value", "net_value", "buy_avg", "sell_avg"]].copy()
-        acc_show.columns = ["Broker", "Buy Value", "Sell Value", "Net Buy", "Avg Buy", "Avg Sell"]
-        st.dataframe(
-            acc_show.style.format({
-                "Buy Value": lambda x: f"Rp {x/1e9:,.2f} B",
-                "Sell Value": lambda x: f"Rp {x/1e9:,.2f} B",
-                "Net Buy": lambda x: f"Rp {x/1e9:,.2f} B",
-                "Avg Buy": lambda x: f"Rp {x:,.0f}",
-                "Avg Sell": lambda x: f"Rp {x:,.0f}",
-            }),
-            use_container_width=True, hide_index=True, height=150
+            "🚀 KATALIS POSITIF = potensi dukungan harga  •  "
+            "⚠️ WARNING = potensi tekanan  •  "
+            "⚪ NETRAL = dampak belum jelas"
         )
 
-    with c2:
-        st.markdown("### 🔴 Top 3 Distribusi")
-        dist_show = top_dist[["broker", "buy_value", "sell_value", "net_value", "buy_avg", "sell_avg"]].copy()
-        dist_show["net_value"] = dist_show["net_value"].abs()
-        dist_show.columns = ["Broker", "Buy Value", "Sell Value", "Net Sell", "Avg Buy", "Avg Sell"]
-        st.dataframe(
-            dist_show.style.format({
-                "Buy Value": lambda x: f"Rp {x/1e9:,.2f} B",
-                "Sell Value": lambda x: f"Rp {x/1e9:,.2f} B",
-                "Net Sell": lambda x: f"Rp {x/1e9:,.2f} B",
-                "Avg Buy": lambda x: f"Rp {x:,.0f}",
-                "Avg Sell": lambda x: f"Rp {x:,.0f}",
-            }),
-            use_container_width=True, hide_index=True, height=150
+        stock_news = []
+        for q in [
+            f"{ticker.replace('.JK','')} saham Indonesia",
+            f"{ticker.replace('.JK','')} IDX",
+            f"{ticker.replace('.JK','')} emiten"
+        ]:
+            stock_news.extend(fetch_google_news_rss(q, limit=5))
+
+        stock_news = _unique_news(stock_news, 8)
+
+        sector_news = _unique_news(
+            fetch_google_news_rss(
+                f"{sektor} saham Indonesia",
+                limit=8
+            ),
+            8
         )
 
-    st.caption(
-        f"End date broker summary: {pd.Timestamp(available_end).strftime('%d-%m-%Y')} "
-        f"• Window: {pd.Timestamp(dates.min()).strftime('%d-%m-%Y')} – "
-        f"{pd.Timestamp(dates.max()).strftime('%d-%m-%Y')}"
-    )
+        market_news = []
+        for q in [
+            "IHSG saham Indonesia",
+            "rupiah Bank Indonesia saham",
+            "bursa Indonesia market"
+        ]:
+            market_news.extend(
+                fetch_google_news_rss(q, limit=5)
+            )
 
-    # Daily movement chart: total positive vs total negative broker net value.
-    daily_chart = (
-        flow.assign(
-            Accumulation=flow["net_value"].clip(lower=0),
-            Distribution=flow["net_value"].clip(upper=0),
-        )
-        .groupby("date")[["Accumulation", "Distribution"]]
-        .sum()
-        .reset_index()
-    )
+        market_news = _unique_news(market_news, 8)
 
-    fig_flow = go.Figure()
-    fig_flow.add_trace(go.Bar(
-        x=daily_chart["date"], y=daily_chart["Accumulation"],
-        name="Akumulasi", marker_color="#22c55e"
-    ))
-    fig_flow.add_trace(go.Bar(
-        x=daily_chart["date"], y=daily_chart["Distribution"],
-        name="Distribusi", marker_color="#ef4444"
-    ))
-    fig_flow.add_hline(y=0, line_width=1, line_color="#777")
-    fig_flow.update_layout(
-        template="plotly_dark", paper_bgcolor="#11161d", plot_bgcolor="#11161d",
-        height=320, barmode="relative",
-        yaxis=dict(title="Net Broker Flow (Rp)", tickformat=".2s"),
-        margin=dict(l=10, r=10, t=20, b=10),
-        legend=dict(orientation="h", y=1.08, x=0),
-    )
-    st.plotly_chart(fig_flow, use_container_width=True, config={"displayModeBar": False})
+        stock_sentiment, _ = _news_sentiment(stock_news)
+        sector_sentiment, _ = _news_sentiment(sector_news)
+        market_sentiment, _ = _news_sentiment(market_news)
 
-    st.markdown("### 📅 Distribusi Broker Per Hari")
-    st.dataframe(
-        daily.sort_values("Tanggal", ascending=False),
-        use_container_width=True, hide_index=True, height=300
-    )
+        a, b, c = st.columns(3)
 
-    # Cumulative broker leaderboard across the displayed window.
-    cumulative = (
-        flow.groupby("broker", as_index=False)["net_value"]
-        .sum()
-        .sort_values("net_value", ascending=False)
-    )
-    cum_acc = cumulative.head(3).copy()
-    cum_dist = cumulative.sort_values("net_value").head(3).copy()
-    q1, q2 = st.columns(2)
-    with q1:
-        st.markdown("### 🟢 Top 3 Akumulasi Kumulatif")
-        st.dataframe(
-            cum_acc.rename(columns={"broker":"Broker", "net_value":"Net Buy"})
-            .assign(**{"Net Buy": lambda d: d["Net Buy"].map(lambda x: f"Rp {x/1e9:,.2f} B")}),
-            use_container_width=True, hide_index=True
-        )
-    with q2:
-        st.markdown("### 🔴 Top 3 Distribusi Kumulatif")
-        cum_dist = cum_dist.rename(columns={"broker":"Broker", "net_value":"Net Sell"}).copy()
-        cum_dist["Net Sell"] = cum_dist["Net Sell"].abs().map(lambda x: f"Rp {x/1e9:,.2f} B")
-        st.dataframe(cum_dist, use_container_width=True, hide_index=True)
+        a.metric("Sentimen Saham", stock_sentiment)
+        b.metric("Sentimen Sektor", sector_sentiment)
+        c.metric("Sentimen Market", market_sentiment)
+
+        n1, n2 = st.columns(2)
+
+        with n1:
+            st.markdown(f"### 🔥 NEWS {ticker.replace('.JK','')}")
+            _render_news_items(stock_news, 6)
+
+        with n2:
+            st.markdown(f"### 🏦 NEWS SEKTOR — {sektor}")
+            _render_news_items(sector_news, 6)
+
+        st.markdown("### 🌎 MARKET NEWS — IHSG / INDONESIA")
+        _render_news_items(market_news, 8)
 
 
 # =========================================================
@@ -5605,23 +6587,6 @@ if analysis_mode.startswith("📅"):
                 "bukan sebagai sinyal entry tunggal."
             )
 
-    # =====================================================
-    # BROKER / BANDAR FLOW — replaces STOCK VS IHSG + SIMILAR STOCKS
-    # =====================================================
-    broker_window = st.sidebar.selectbox(
-        "Broker Flow History",
-        [5, 20, 40, 60, 120, 250],
-        index=0,
-        help="Jumlah hari perdagangan yang ditampilkan pada Broker Flow."
-    )
-
-    render_broker_flow_module(
-        ticker=ticker,
-        stock_data=stock_data,
-        end_date=pd.to_datetime(stock_data["Date"]).max(),
-        broker_window=broker_window,
-    )
-
     # =========================================================
 # TECHNICAL ANALYSIS MODE — ORIGINAL ANALYSIS ENGINE
 # =========================================================
@@ -5734,6 +6699,19 @@ if analysis_mode.startswith("📊"):
         )
 
         st.stop()
+
+
+    # =========================================================
+    # SUPPORT / RESISTANCE INTELLIGENCE + NEWS
+    # =========================================================
+    # Modul ini KHUSUS Analisa Saham. Tidak ditampilkan pada
+    # Screening Seasonality maupun Sektoral IDX.
+    render_support_resistance_news_module(
+        ticker=ticker_input,
+        stock_data=df,
+        sektor=sektor if "sektor" in locals() else "-",
+        lookback=lookback_sr,
+    )
 
 
     # =========================================================
@@ -6245,79 +7223,87 @@ if analysis_mode.startswith("📊"):
         </div>''')
 
     # =========================================================
-    # BACKTEST SCORE ENGINE + BEST THRESHOLD
+    # DECISION ENGINE
+    # Backtest tetap dihitung untuk validasi historis, tetapi tabel threshold
+    # panjang tidak ditampilkan.
     # =========================================================
-    render_html('''<div class="section-header"><span>🧪</span><b>BACKTEST SCORE ENGINE</b><div class="section-line"></div></div>''')
-    if len(eval_data)<30:
-        st.warning("Histori terlalu sedikit untuk backtest.")
-        comparison=pd.DataFrame()
-        best_threshold=3
-        best={"TOTAL_RETURN":0,"WIN_RATE":0,"JUMLAH_TRADE":0,"MAX_DRAWDOWN":0,"PROFIT_FACTOR":0}
+    if len(eval_data) < 30:
+        best_threshold = 3
+        backtests = [jalankan_backtest(eval_data, best_threshold)]
     else:
-        thresholds=list(range(1,7))
-        backtests=[jalankan_backtest(eval_data,t) for t in thresholds]
-        comparison=pd.DataFrame([{
-            "Threshold":x["THRESHOLD"],"Jumlah Trade":x["JUMLAH_TRADE"],"Win Rate":x["WIN_RATE"],
-            "Avg Return":x["AVG_RETURN"],"Total Return":x["TOTAL_RETURN"],"Max Drawdown":x["MAX_DRAWDOWN"],"Profit Factor":x["PROFIT_FACTOR"]
-        } for x in backtests])
-        display_comparison=comparison.copy()
-        for col in ["Win Rate","Avg Return","Total Return","Max Drawdown"]:
-            display_comparison[col]=display_comparison[col].map(lambda x:f"{x*100:.2f}%")
-        display_comparison["Profit Factor"]=display_comparison["Profit Factor"].map(lambda x:"∞" if np.isinf(x) else f"{x:.2f}")
-        bleft,bright=st.columns([2.3,1])
-        with bleft:
-            render_table(display_comparison)
-        valid=comparison[comparison["Jumlah Trade"]>=10].copy()
-        if not valid.empty:
-            valid["PF_SORT"]=valid["Profit Factor"].replace(np.inf,999999)
-            best_row=valid.sort_values(["PF_SORT","Total Return"],ascending=False).iloc[0]
-            best_threshold=int(best_row["Threshold"])
-        else:
-            best_threshold=3
-        best=jalankan_backtest(eval_data,best_threshold)
-        with bright:
-            pf_text = "∞" if np.isinf(best["PROFIT_FACTOR"]) else f"{best['PROFIT_FACTOR']:.2f}"
-            tr_cls="positive" if best["TOTAL_RETURN"]>=0 else "negative"
-            dd_cls="negative" if best["MAX_DRAWDOWN"]<0 else "positive"
-            wr_cls="positive" if best["WIN_RATE"]>=.5 else "negative"
-            render_html(f'''
-            <div class="threshold-card">
-              <div class="threshold-badge">🏆 Optimal Backtest</div>
-              <div class="threshold-title">Best BUY Threshold</div>
-              <div class="threshold-number">≥ {best_threshold}</div>
-              <div class="threshold-sub">Kombinasi Profit Factor dan Total Return terbaik.</div>
-              <div class="threshold-stats">
-                <div class="threshold-stat"><div class="lbl">Total Return</div><div class="val {tr_cls}">{best["TOTAL_RETURN"]*100:.2f}%</div></div>
-                <div class="threshold-stat"><div class="lbl">Win Rate</div><div class="val {wr_cls}">{best["WIN_RATE"]*100:.2f}%</div></div>
-                <div class="threshold-stat"><div class="lbl">Jumlah Trade</div><div class="val">{best["JUMLAH_TRADE"]}</div></div>
-                <div class="threshold-stat"><div class="lbl">Max Drawdown</div><div class="val {dd_cls}">{best["MAX_DRAWDOWN"]*100:.2f}%</div></div>
-                <div class="threshold-stat"><div class="lbl">Profit Factor</div><div class="val">{pf_text}</div></div>
-                <div class="threshold-stat"><div class="lbl">Current Score</div><div class="val">{current_score}/6</div></div>
-              </div>
-            </div>''')
+        thresholds = list(range(1, 7))
+        backtests = [jalankan_backtest(eval_data, t) for t in thresholds]
 
-    # =========================================================
-    # FINAL AI DECISION + REASONS + TRADING SUMMARY
-    # =========================================================
-    score_ok=current_score>=best_threshold
-    prob_ok=pd.notna(probability_up) and probability_up>=0.50
-    expectancy_ok=pd.notna(expectancy) and expectancy>0
-    macd_ok=macd_bullish
-    cmf_ok=cmf_positive
-    cmo_ok=cmo_positive
-    final_points=sum([score_ok,prob_ok,expectancy_ok,macd_ok,cmf_ok,cmo_ok])
-    if final_points>=5:
-        final_signal="🟢 BUY"; signal_class="signal-buy"
-    elif final_points>=3:
-        final_signal="🟡 WAIT"; signal_class="signal-wait"
+        # Pilih threshold terbaik berdasarkan profit factor terlebih dahulu,
+        # kemudian total return. Threshold hanya menjadi parameter internal.
+        def _bt_value(row, *keys):
+            for key in keys:
+                if isinstance(row, dict) and key in row:
+                    try:
+                        value = float(row[key])
+                        if np.isfinite(value):
+                            return value
+                    except Exception:
+                        pass
+            return np.nan
+
+        def _bt_rank(row):
+            pf = _bt_value(row, "PROFIT_FACTOR", "profit_factor")
+            tr = _bt_value(row, "TOTAL_RETURN", "total_return")
+            wr = _bt_value(row, "WIN_RATE", "win_rate")
+            pf_rank = pf if np.isfinite(pf) else -999999
+            tr_rank = tr if np.isfinite(tr) else -999999
+            wr_rank = wr if np.isfinite(wr) else -999999
+            return (pf_rank, tr_rank, wr_rank)
+
+        best_row = max(backtests, key=_bt_rank)
+        best_threshold = int(
+            _bt_value(best_row, "THRESHOLD", "threshold")
+            if np.isfinite(_bt_value(best_row, "THRESHOLD", "threshold"))
+            else 3
+        )
+
+    comparison = pd.DataFrame(backtests)
+
+    # ---------------------------------------------------------
+    # Final score: 6 decision factors.
+    # ---------------------------------------------------------
+    score_ok = bool(current_score >= best_threshold)
+    prob_ok = bool(
+        pd.notna(probability_up) and probability_up >= 0.50
+    )
+    expectancy_ok = bool(
+        pd.notna(expectancy) and expectancy > 0
+    )
+    macd_ok = bool(macd_bullish)
+    cmf_ok = bool(cmf_now > 0)
+    cmo_ok = bool(cmo_now > 0)
+
+    final_points = int(sum([
+        score_ok,
+        prob_ok,
+        expectancy_ok,
+        macd_ok,
+        cmf_ok,
+        cmo_ok,
+    ]))
+
+    if final_points >= 5 and score_ok and prob_ok:
+        final_signal = "BUY"
+        signal_class = "signal-buy"
+    elif final_points <= 2:
+        final_signal = "SELL / AVOID"
+        signal_class = "signal-sell"
     else:
-        final_signal="🔴 AVOID"; signal_class="signal-avoid"
+        final_signal = "WAIT"
+        signal_class = "signal-wait"
 
-    f1,f2,f3=st.columns([1.15,1.05,1.15])
+    conf = final_points / 6 * 100
+
+    f1 = st.container()
     with f1:
         render_html('''<div class="section-header"><span>🎯</span><b>FINAL AI DECISION</b><div class="section-line"></div></div>''')
-        conf=final_points/6*100
-        prob_text="-" if pd.isna(probability_up) else f"{probability_up*100:.2f}%"
+        prob_text = "-" if pd.isna(probability_up) else f"{probability_up*100:.2f}%"
         render_html(f'''
         <div class="{signal_class}">
           <div style="display:flex;gap:8px;align-items:stretch;">
@@ -6326,17 +7312,8 @@ if analysis_mode.startswith("📊"):
             <div style="flex:1"><div class="ai-card-title">PROBABILITY</div><div class="ai-card-value">{prob_text}</div><div class="ai-card-sub">Historical probability</div></div>
           </div>
         </div>''')
-    with f2:
-        render_html('''<div class="section-header"><span>🔎</span><b>AI DECISION REASONS</b><div class="section-line"></div></div>''')
-        items=[
-            (score_ok,f"Score: {current_score} dari maksimal 6"),
-            (prob_ok,"Probability naik: " + (f"{probability_up*100:.2f}%" if pd.notna(probability_up) else "-")),
-            (expectancy_ok,"Expectancy: " + (f"{expectancy*100:.2f}%" if pd.notna(expectancy) else "-")),
-            (macd_ok,"MACD: bullish" if macd_ok else "MACD: bearish"),
-            (cmf_ok,"CMF: positif (akumulasi)" if cmf_ok else "CMF: negatif (distribusi)"),
-            (cmo_ok,f"CMO: positif ({cmo_now:.2f})" if cmo_ok else f"CMO: negatif ({cmo_now:.2f})"),
-            (volume_high,"Volume di atas median" if volume_high else "Volume normal/rendah")]
-        render_html('<div class="ai-card">'+''.join(f"<div style='margin:5px 0'>{'🟢' if ok else '⚪'} {txt}</div>" for ok,txt in items)+'</div>')
+
+
 # =========================================================
 # DATA + NOTES
 
