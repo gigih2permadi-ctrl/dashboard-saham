@@ -6515,6 +6515,24 @@ def render_idx_sector_module():
                 cells.append(f'<td class="phase" style="{phase_css}">{safe}</td>')
             elif col == "Keterangan":
                 cells.append(f'<td class="note" style="{phase_css}">{safe}</td>')
+            elif col == "Return_%":
+                # Warna Return mengikuti arah pergerakan: plus = bullish/hijau,
+                # minus = bearish/merah. Jika Open == Close, netral/putih.
+                try:
+                    open_px = float(row.get("Open", np.nan))
+                    close_px = float(row.get("Close", np.nan))
+                    ret_val = float(row.get("Return_%", np.nan))
+                    if np.isfinite(open_px) and np.isfinite(close_px) and np.isclose(open_px, close_px):
+                        ret_color = "#f3f4f6"
+                    elif np.isfinite(ret_val) and ret_val > 0:
+                        ret_color = "#22c55e"
+                    elif np.isfinite(ret_val) and ret_val < 0:
+                        ret_color = "#ef4444"
+                    else:
+                        ret_color = "#f3f4f6"
+                except Exception:
+                    ret_color = "#f3f4f6"
+                cells.append(f'<td class="num return-cell" style="color:{ret_color};font-weight:700">{safe}</td>')
             else:
                 cls = "num" if col in numeric_cols else ""
                 cells.append(f'<td class="{cls}">{safe}</td>')
@@ -6565,6 +6583,7 @@ def render_idx_sector_module():
         background: transparent;
       }}
       .idx-story-table td.num {{ text-align: right; font-variant-numeric: tabular-nums; }}
+      .idx-story-table td.return-cell {{ min-width: 78px; }}
       .idx-story-table td.phase {{ white-space: nowrap; min-width: 175px; }}
       .idx-story-table td.note {{
         white-space: normal;
@@ -6578,7 +6597,7 @@ def render_idx_sector_module():
     </style>
     '''
     st.markdown(table_html, unsafe_allow_html=True)
-    st.caption("Warna teks: 🟢 breakout/gainer • 🔴 breakdown/loser/distribution • 🟧 volume spike • 🟨 resistance • 🟦 support • 🟪 momentum • ⬜ swing/consolidation. Kolom Keterangan dibuat wrap agar seluruh penjelasan terbaca.")
+    st.caption("Warna teks: Return + = hijau (bullish) • Return − = merah (bearish) • Open = Close = putih (netral). Phase/Keterangan juga diberi warna teks sesuai kondisi; kolom Keterangan dibuat wrap agar seluruh penjelasan terbaca.")
 
     # =====================================================
     # FAKTOR DINAMIS
