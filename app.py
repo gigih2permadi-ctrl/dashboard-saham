@@ -5497,53 +5497,880 @@ def idx_get_ihsg_overview():
     return google_finance_quote("COMPOSITE:IDX")
 
 
+
+# =========================================================
+# IDX MARKET MOVERS + STORY ANALYSIS
+# =========================================================
+
+def _idx_name_from_master(ticker):
+    rows = master[master["Ticker"].astype(str).str.upper() == str(ticker).upper()]
+    if rows.empty:
+        return str(ticker)
+    r = rows.iloc[0]
+    for col in ["Nama", "Nama Emiten", "Company", "Emiten", "Name"]:
+        if col in rows.columns and pd.notna(r[col]) and str(r[col]).strip():
+            return str(r[col]).strip()
+    return str(ticker)
+
+
+def _idx_sector_from_master(ticker):
+    rows = master[master["Ticker"].astype(str).str.upper() == str(ticker).upper()]
+    if rows.empty:
+        return "-"
+    for col in ["Sektor", "Sector"]:
+        if col in rows.columns and pd.notna(rows.iloc[0][col]):
+            return str(rows.iloc[0][col])
+    return "-"
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def idx_market_movers(tickers, top_n=20, stockbit_token=""):
+    """Market Movers IDX yang berusaha meniru urutan Movers Stockbit.
+
+    Prioritas sumber:
+      1) Stockbit Hotlist jika STOCKBIT_TOKEN tersedia/endpoint dapat diakses.
+      2) Sumber publik berbasis ringkasan IDX (Chamid) untuk Top Gainer/Loser.
+      3) Yahoo Finance sebagai fallback terakhir.
+
+    Penting: ranking selalu berdasarkan perubahan % harian:
+      - Gainer: terbesar -> terkecil
+      - Loser : terkecil/ternegatif -> terbesar
+
+    Sumber publik dipakai agar daftar tetap market-wide dan tidak terbatas pada
+    saham yang kebetulan ada di saham_master.xlsx.
+    """
+    tickers = [str(x).upper().replace(".JK", "").strip() for x in tickers if str(x).strip()]
+    tickers = list(dict.fromkeys(tickers))
+
+    def _stockbit_token_from_secrets():
+        try:
+            return str(st.secrets.get("STOCKBIT_TOKEN", "") or "").strip()
+        except Exception:
+            return ""
+
+    token = (stockbit_token or _stockbit_token_from_secrets()).strip()
+
+    def _pick(d, keys):
+        for k in keys:
+            if k in d and d[k] not in (None, ""):
+                return d[k]
+        return None
+
+    def _parse_num(v):
+        try:
+            if isinstance(v, str):
+                x = v.strip().replace("%", "").replace(",", "").replace("Rp", "").strip()
+                return float(x)
+            return float(v)
+        except Exception:
+            return np.nan
+
+    def _parse_pct(v):
+        x = _parse_num(v)
+        return x if np.isfinite(x) else np.nan
+
+    def _flatten_rows(obj):
+        found = []
+        if isinstance(obj, list):
+            if obj and all(isinstance(x, dict) for x in obj):
+                found.append(obj)
+            for x in obj:
+                found.extend(_flatten_rows(x))
+        elif isinstance(obj, dict):
+            for v in obj.values():
+                found.extend(_flatten_rows(v))
+        return found
+
+    # ---------------------------------------------------------
+    # 1) STOCKBIT HOTLIST (opsional)
+    # ---------------------------------------------------------
+    def _stockbit_hotlist(kind):
+        url = f"https://exodus.stockbit.com/emitten/hotlist/{kind}?limit={max(int(top_n), 100)}"
+        headers = {
+            "Accept": "application/json",
+            "Origin": "https://stockbit.com",
+            "Referer": "https://stockbit.com/",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/140 Safari/537.36",
+        }
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        try:
+            r = requests.get(url, headers=headers, timeout=10)
+            if r.status_code != 200:
+                return pd.DataFrame()
+            payload = r.json()
+        except Exception:
+            return pd.DataFrame()
+
+        rows = []
+        for group in _flatten_rows(payload):
+            for item in group:
+                symbol = _pick(item, ["symbol", "ticker", "code", "stock_code", "stockCode", "sec_code"])
+                if isinstance(symbol, dict):
+                    symbol = _pick(symbol, ["symbol", "code", "ticker"])
+                if symbol is None:
+                    continue
+                symbol = str(symbol).upper().replace(".JK", "").strip()
+                price = _parse_num(_pick(item, ["last", "last_price", "lastPrice", "price", "close", "current_price", "currentPrice"]))
+                pct = _parse_pct(_pick(item, ["percent", "percentage", "change_percent", "changePercent", "change_percentage", "changePercentage", "change_ratio", "changeRatio", "change_pct"]))
+                change = _parse_num(_pick(item, ["change", "change_amount", "changeAmount", "price_change", "priceChange"]))
+                prev = _parse_num(_pick(item, ["prev_close", "previous_close", "prevClose", "previousClose"]))
+                if not np.isfinite(pct) and np.isfinite(price) and np.isfinite(prev) and prev != 0:
+                    pct = (price / prev - 1.0) * 100.0
+                if not np.isfinite(change) and np.isfinite(price) and np.isfinite(prev):
+                    change = price - prev
+                if not np.isfinite(pct):
+                    continue
+                company = _pick(item, ["company_name", "companyName", "company", "name", "issuer_name", "issuerName"])
+                rows.append({
+                    "Ticker": symbol,
+                    "Company": str(company).strip() if company else _idx_name_from_master(symbol),
+                    "Sector": _idx_sector_from_master(symbol),
+                    "Price": price,
+                    "Change": change,
+                    "Change_%": pct,
+                    "Volume": _parse_num(_pick(item, ["volume", "vol", "volume_value"])),
+                    "Date": pd.Timestamp.today().date(),
+                    "Source": "Stockbit Movers",
+                })
+        if not rows:
+            return pd.DataFrame()
+        return pd.DataFrame(rows).drop_duplicates("Ticker")
+
+    if token:
+        g_stock = _stockbit_hotlist("topGainer")
+        l_stock = _stockbit_hotlist("topLoser")
+        if not g_stock.empty and not l_stock.empty:
+            return (
+                g_stock.sort_values(["Change_%", "Ticker"], ascending=[False, True]).head(top_n).reset_index(drop=True),
+                l_stock.sort_values(["Change_%", "Ticker"], ascending=[True, True]).head(top_n).reset_index(drop=True),
+            )
+
+    # ---------------------------------------------------------
+    # 2) PUBLIC IDX-DERIVED MOVERS
+    #    Market-wide; tidak bergantung pada saham_master.xlsx.
+    # ---------------------------------------------------------
+    def _public_movers(url, loser=False):
+        try:
+            html = requests.get(
+                url,
+                headers={"User-Agent": "Mozilla/5.0"},
+                timeout=12,
+            )
+            html.raise_for_status()
+            tables = pd.read_html(html.text)
+        except Exception:
+            return pd.DataFrame()
+
+        if not tables:
+            return pd.DataFrame()
+
+        table = None
+        for tb in tables:
+            cols = [str(c).strip().lower() for c in tb.columns]
+            if any("saham" in c for c in cols) and any("harga" in c for c in cols):
+                table = tb.copy()
+                break
+        if table is None:
+            return pd.DataFrame()
+
+        # Normalisasi nama kolom.
+        rename = {}
+        for c in table.columns:
+            cl = str(c).strip().lower()
+            if "saham" in cl:
+                rename[c] = "Ticker"
+            elif "perusahaan" in cl:
+                rename[c] = "Company"
+            elif "harga" in cl:
+                rename[c] = "Price"
+            elif "kenaikan" in cl or "penurunan" in cl or "perubahan" in cl:
+                rename[c] = "Move"
+        table = table.rename(columns=rename)
+        if "Ticker" not in table.columns or "Move" not in table.columns:
+            return pd.DataFrame()
+
+        table["Ticker"] = table["Ticker"].astype(str).str.upper().str.strip().str.replace(".JK", "", regex=False)
+        table["Price"] = table.get("Price", np.nan).map(_parse_num)
+        table["Change_%"] = table["Move"].map(_parse_pct)
+        if loser:
+            table["Change_%"] = -table["Change_%"].abs()
+        else:
+            table["Change_%"] = table["Change_%"].abs()
+        # Pulihkan perubahan nominal dari harga penutupan dan % perubahan.
+        # prev = price / (1 + pct/100), sehingga Change = price - prev.
+        table["Change"] = np.where(
+            pd.to_numeric(table["Price"], errors="coerce").notna()
+            & pd.to_numeric(table["Change_%"], errors="coerce").notna()
+            & ((1.0 + pd.to_numeric(table["Change_%"], errors="coerce") / 100.0) != 0),
+            pd.to_numeric(table["Price"], errors="coerce")
+            - pd.to_numeric(table["Price"], errors="coerce")
+            / (1.0 + pd.to_numeric(table["Change_%"], errors="coerce") / 100.0),
+            np.nan,
+        )
+        table["Company"] = table.get("Company", table["Ticker"]).astype(str)
+        table["Sector"] = table["Ticker"].map(_idx_sector_from_master)
+        table["Volume"] = np.nan
+        table["Date"] = pd.Timestamp.today().date()
+        table["Source"] = "IDX public movers"
+        table = table.dropna(subset=["Change_%"]).drop_duplicates("Ticker")
+        return table[["Ticker","Company","Sector","Price","Change","Change_%","Volume","Date","Source"]]
+
+    public_g = _public_movers("https://chamid.org/topgainer/", loser=False)
+    public_l = _public_movers("https://chamid.org/toploser/", loser=True)
+    if not public_g.empty and not public_l.empty:
+        # Jika harga tersedia, hitung nominal change dari % hanya bila prev price
+        # tidak tersedia; % tetap menjadi dasar ranking utama.
+        return (
+            public_g.sort_values(["Change_%", "Ticker"], ascending=[False, True]).head(top_n).reset_index(drop=True),
+            public_l.sort_values(["Change_%", "Ticker"], ascending=[True, True]).head(top_n).reset_index(drop=True),
+        )
+
+    # ---------------------------------------------------------
+    # 3) YAHOO FINANCE FALLBACK
+    #    Chunk kecil + retry agar small/mid caps tidak hilang hanya karena
+    #    multi-ticker download gagal sebagian.
+    # ---------------------------------------------------------
+    records = []
+
+    def _yahoo_one(t):
+        try:
+            d = yf.download(
+                t + ".JK",
+                period="10d", interval="1d", auto_adjust=False,
+                progress=False, threads=False, group_by="column",
+            )
+            d = _flat_ohlcv(d)
+            if d is None or d.empty or "Close" not in d.columns:
+                return None
+            d = d.dropna(subset=["Close"])
+            if len(d) < 2:
+                return None
+            last = float(d["Close"].iloc[-1]); prev = float(d["Close"].iloc[-2])
+            if not np.isfinite(last) or not np.isfinite(prev) or prev == 0:
+                return None
+            vol = float(d["Volume"].iloc[-1]) if "Volume" in d.columns and pd.notna(d["Volume"].iloc[-1]) else np.nan
+            return {
+                "Ticker": t,
+                "Company": _idx_name_from_master(t),
+                "Sector": _idx_sector_from_master(t),
+                "Price": last,
+                "Change": last - prev,
+                "Change_%": (last / prev - 1.0) * 100.0,
+                "Volume": vol,
+                "Date": pd.Timestamp(d.index[-1]).date(),
+                "Source": "Yahoo Finance fallback",
+            }
+        except Exception:
+            return None
+
+    # Batch kecil dulu.
+    for i in range(0, len(tickers), 10):
+        chunk = tickers[i:i+10]
+        try:
+            raw = yf.download(
+                [x + ".JK" for x in chunk],
+                period="10d", interval="1d", auto_adjust=False,
+                progress=False, threads=False, group_by="ticker",
+            )
+        except Exception:
+            raw = pd.DataFrame()
+        if raw is not None and not raw.empty:
+            try:
+                if isinstance(raw.columns, pd.MultiIndex):
+                    lv0 = set(map(str, raw.columns.get_level_values(0)))
+                    lv1 = set(map(str, raw.columns.get_level_values(1)))
+                    for t in chunk:
+                        yt = t + ".JK"
+                        try:
+                            if yt in lv0:
+                                d = raw[yt].copy()
+                            elif yt in lv1:
+                                d = raw.xs(yt, axis=1, level=1).copy()
+                            else:
+                                continue
+                            d = d.dropna(subset=["Close"])
+                            if len(d) < 2:
+                                continue
+                            last = float(d["Close"].iloc[-1]); prev = float(d["Close"].iloc[-2])
+                            if prev == 0:
+                                continue
+                            records.append({
+                                "Ticker": t,
+                                "Company": _idx_name_from_master(t),
+                                "Sector": _idx_sector_from_master(t),
+                                "Price": last,
+                                "Change": last - prev,
+                                "Change_%": (last / prev - 1.0) * 100.0,
+                                "Volume": float(d["Volume"].iloc[-1]) if "Volume" in d.columns and pd.notna(d["Volume"].iloc[-1]) else np.nan,
+                                "Date": pd.Timestamp(d.index[-1]).date(),
+                                "Source": "Yahoo Finance fallback",
+                            })
+                        except Exception:
+                            continue
+                elif len(chunk) == 1:
+                    rec = _yahoo_one(chunk[0])
+                    if rec:
+                        records.append(rec)
+            except Exception:
+                pass
+
+    df = pd.DataFrame(records).drop_duplicates("Ticker") if records else pd.DataFrame()
+
+    # Jika hasil Yahoo terlalu sedikit, lengkapi ticker yang belum terambil secara individual.
+    if len(df) < max(50, top_n * 2):
+        have = set(df["Ticker"]) if not df.empty else set()
+        missing = [t for t in tickers if t not in have]
+        for t in missing:
+            rec = _yahoo_one(t)
+            if rec:
+                records.append(rec)
+        df = pd.DataFrame(records).drop_duplicates("Ticker") if records else pd.DataFrame()
+
+    if df.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    return (
+        df.sort_values(["Change_%", "Ticker"], ascending=[False, True]).head(top_n).reset_index(drop=True),
+        df.sort_values(["Change_%", "Ticker"], ascending=[True, True]).head(top_n).reset_index(drop=True),
+    )
+
+@st.cache_data(ttl=900, show_spinner=False)
+def idx_history(ticker, days=60):
+    try:
+        d = yf.download(
+            str(ticker).upper().replace(".JK", "") + ".JK",
+            period="6mo", interval="1d", auto_adjust=False,
+            progress=False, threads=False, group_by="column"
+        )
+        d = _flat_ohlcv(d)
+        if d.empty:
+            return pd.DataFrame()
+        d = d.tail(days).copy()
+        for c in ["Open","High","Low","Close","Volume"]:
+            if c in d.columns:
+                d[c] = pd.to_numeric(d[c], errors="coerce")
+        d["Return_%"] = d["Close"].pct_change()*100
+        d["MA20"] = d["Close"].rolling(20).mean()
+        d["MA50"] = d["Close"].rolling(50).mean()
+        d["VOL_MA20"] = d["Volume"].rolling(20).mean()
+        d["Volume_Ratio"] = d["Volume"] / d["VOL_MA20"].replace(0, np.nan)
+        prev_close = d["Close"].shift(1)
+        tr = pd.concat([
+            d["High"]-d["Low"],
+            (d["High"]-prev_close).abs(),
+            (d["Low"]-prev_close).abs()
+        ], axis=1).max(axis=1)
+        d["ATR14"] = tr.rolling(14).mean()
+        d["ATR_%"] = d["ATR14"] / d["Close"] * 100
+        delta = d["Close"].diff()
+        gain = delta.clip(lower=0).rolling(14).mean()
+        loss = (-delta.clip(upper=0)).rolling(14).mean()
+        rs = gain / loss.replace(0, np.nan)
+        d["RSI14"] = 100 - (100/(1+rs))
+        high20 = d["High"].rolling(20).max().shift(1)
+        low20 = d["Low"].rolling(20).min().shift(1)
+        d["Resistance20"] = high20
+        d["Support20"] = low20
+        d["Dist_Resistance_%"] = (d["Close"] / high20 - 1)*100
+        d["Dist_Support_%"] = (d["Close"] / low20 - 1)*100
+        # Money-flow proxy dari OHLCV, dipakai hanya bila broker file belum tersedia.
+        hl = (d["High"]-d["Low"]).replace(0,np.nan)
+        mfm = ((d["Close"]-d["Low"]) - (d["High"]-d["Close"])) / hl
+        d["CMF20"] = (mfm*d["Volume"]).rolling(20).sum() / d["Volume"].rolling(20).sum()
+        d.index = pd.to_datetime(d.index)
+        return d
+    except Exception:
+        return pd.DataFrame()
+
+
+def idx_load_broker(uploaded):
+    if uploaded is None:
+        return pd.DataFrame()
+    try:
+        if uploaded.name.lower().endswith(".csv"):
+            b = pd.read_csv(uploaded)
+        else:
+            b = pd.read_excel(uploaded)
+    except Exception as e:
+        st.error(f"Gagal membaca broker file: {e}")
+        return pd.DataFrame()
+    b.columns = [str(c).strip() for c in b.columns]
+    aliases = {
+        "date":"Date", "tanggal":"Date", "tgl":"Date",
+        "ticker":"Ticker", "kode":"Ticker", "emiten":"Ticker",
+        "broker":"Broker", "kode broker":"Broker",
+        "buy value":"Buy Value", "b.val":"Buy Value", "b val":"Buy Value",
+        "sell value":"Sell Value", "s.val":"Sell Value", "s val":"Sell Value",
+        "buy lot":"Buy Lot", "b.lot":"Buy Lot",
+        "sell lot":"Sell Lot", "s.lot":"Sell Lot",
+        "buy avg":"Buy Avg", "b.avg":"Buy Avg",
+        "sell avg":"Sell Avg", "s.avg":"Sell Avg",
+    }
+    rename={}
+    for c in b.columns:
+        key=c.lower().strip()
+        if key in aliases: rename[c]=aliases[key]
+    b=b.rename(columns=rename)
+    required={"Date","Ticker","Broker","Buy Value","Sell Value"}
+    if not required.issubset(b.columns):
+        st.warning("Broker file belum sesuai template. Minimal kolom: Date, Ticker, Broker, Buy Value, Sell Value.")
+        return pd.DataFrame()
+    b["Date"] = pd.to_datetime(b["Date"], errors="coerce")
+    b["Ticker"] = b["Ticker"].astype(str).str.upper().str.replace(".JK","",regex=False).str.strip()
+    for c in ["Buy Value","Sell Value","Buy Lot","Sell Lot","Buy Avg","Sell Avg"]:
+        if c in b.columns:
+            b[c]=b[c].apply(idx_parse_number)
+    b["Net Value"] = b["Buy Value"] - b["Sell Value"]
+    b["Status"] = np.where(b["Net Value"]>0,"AKUMULASI",np.where(b["Net Value"]<0,"DISTRIBUSI","NETRAL"))
+    return b.dropna(subset=["Date","Ticker","Broker"]).sort_values(["Date","Ticker","Net Value"], ascending=[True,True,False]).reset_index(drop=True)
+
+
+def idx_broker_for_ticker(broker_df, ticker, end_date=None):
+    if broker_df.empty:
+        return pd.DataFrame()
+    b=broker_df[broker_df["Ticker"]==ticker.upper()].copy()
+    if end_date is not None:
+        b=b[b["Date"]<=pd.Timestamp(end_date)]
+    return b.sort_values("Date")
+
+
+def idx_factor_story(hist, broker_df, ticker, mover_type):
+    if hist.empty:
+        return [], "Data history belum cukup untuk membangun story pergerakan."
+    x=hist.copy().dropna(subset=["Close"])
+    today=x.iloc[-1]
+    factors=[]
+    # Dynamic evidence, bukan aturan wajib.
+    vol=today.get("Volume_Ratio",np.nan)
+    if np.isfinite(vol):
+        if vol>=4: factors.append(("Volume Explosion", 95, f"Volume {vol:.2f}× MA20"))
+        elif vol>=2: factors.append(("Volume Expansion", 80, f"Volume {vol:.2f}× MA20"))
+        elif vol>=1.3: factors.append(("Volume mulai meningkat", 55, f"Volume {vol:.2f}× MA20"))
+    rsi=today.get("RSI14",np.nan)
+    if np.isfinite(rsi):
+        if mover_type=="Gainer" and rsi>=65: factors.append(("Momentum kuat", 72, f"RSI {rsi:.1f}"))
+        elif mover_type=="Loser" and rsi<=35: factors.append(("Momentum bearish", 72, f"RSI {rsi:.1f}"))
+    ma20=today.get("MA20",np.nan); ma50=today.get("MA50",np.nan); close=today.get("Close",np.nan)
+    if np.isfinite(ma20) and np.isfinite(close):
+        if mover_type=="Gainer" and close>ma20: factors.append(("Trend di atas MA20", 62, f"Close {close:.0f} > MA20 {ma20:.0f}"))
+        elif mover_type=="Loser" and close<ma20: factors.append(("Trend di bawah MA20", 62, f"Close {close:.0f} < MA20 {ma20:.0f}"))
+    # Breakout/breakdown hanya jika benar-benar terjadi.
+    r=today.get("Resistance20",np.nan); sup=today.get("Support20",np.nan)
+    if mover_type=="Gainer" and np.isfinite(r) and close>r:
+        factors.append(("Breakout resistance", 92, f"Close {close:.0f} > resistance {r:.0f}"))
+    if mover_type=="Loser" and np.isfinite(sup) and close<sup:
+        factors.append(("Breakdown support", 92, f"Close {close:.0f} < support {sup:.0f}"))
+    # Resistance/support test jika belum break.
+    if mover_type=="Gainer" and np.isfinite(r) and r>0:
+        dist=abs(close/r-1)*100
+        if dist<=2.5 and close<=r: factors.append(("Resistance test", 76, f"Harga berjarak {dist:.2f}% dari resistance"))
+    if mover_type=="Loser" and np.isfinite(sup) and sup>0:
+        dist=abs(close/sup-1)*100
+        if dist<=2.5 and close>=sup: factors.append(("Support test", 76, f"Harga berjarak {dist:.2f}% dari support"))
+    # Consistency 5 hari.
+    if len(x)>=6:
+        v=x["Volume_Ratio"].tail(5).dropna()
+        if len(v)>=4 and v.iloc[-1]>v.iloc[0] and v.diff().dropna().mean()>0:
+            factors.append(("Volume naik konsisten", 84, f"Volume ratio naik dari {v.iloc[0]:.2f}× ke {v.iloc[-1]:.2f}×"))
+        ret=x["Return_%"].tail(5).dropna()
+        if mover_type=="Gainer" and len(ret)>=4 and (ret>0).sum()>=3:
+            factors.append(("Price strengthening", 68, f"{int((ret>0).sum())}/{len(ret)} hari positif"))
+        if mover_type=="Loser" and len(ret)>=4 and (ret<0).sum()>=3:
+            factors.append(("Price weakening", 68, f"{int((ret<0).sum())}/{len(ret)} hari negatif"))
+    # Broker: agregasi 5/10 hari dan top broker.
+    b=idx_broker_for_ticker(broker_df,ticker,today.name)
+    if not b.empty:
+        recent=b[b["Date"]>=pd.Timestamp(today.name)-pd.Timedelta(days=10)]
+        agg=recent.groupby("Broker")["Net Value"].sum().sort_values(ascending=False)
+        if not agg.empty:
+            if mover_type=="Gainer" and agg.iloc[0]>0:
+                factors.append((f"Broker accumulation {agg.index[0]}", 90, f"Net {agg.iloc[0]:,.0f} selama ±10 hari"))
+            if mover_type=="Loser" and agg.iloc[-1]<0:
+                factors.append((f"Broker distribution {agg.index[-1]}", 90, f"Net {agg.iloc[-1]:,.0f} selama ±10 hari"))
+    factors=sorted(factors,key=lambda z:z[1],reverse=True)
+    if not factors:
+        conclusion="Belum ada satu faktor dominan yang cukup kuat; pergerakan perlu dibaca sebagai kombinasi price action dan volume."
+    else:
+        top=factors[:3]
+        joined="; ".join([f"{a} ({c})" for a,_,c in top])
+        conclusion=f"Pergerakan hari ini paling banyak dikonfirmasi oleh {joined}. Faktor utama dipilih dari bukti yang benar-benar muncul pada history, bukan dipaksakan oleh satu indikator."
+    return factors, conclusion
+
+
+def _idx_phase_details(x, mover_type):
+    """Menentukan fase terakhir berdasarkan bukti historis yang tersedia.
+    Tidak memaksakan satu indikator; fase dipilih dari kombinasi price action,
+    volume, momentum dan posisi terhadap support/resistance.
+    """
+    if x is None or x.empty or "Close" not in x.columns:
+        return "DATA TIDAK CUKUP", "History belum cukup untuk membaca fase."
+
+    z = x.dropna(subset=["Close"]).copy()
+    if len(z) < 5:
+        return "DATA TIDAK CUKUP", "History belum cukup untuk membaca fase."
+
+    t = z.iloc[-1]
+    close = float(t["Close"])
+    prev_close = float(z["Close"].iloc[-2]) if len(z) >= 2 else np.nan
+    ret = float(t.get("Return_%", np.nan)) if pd.notna(t.get("Return_%", np.nan)) else np.nan
+    vol = float(t.get("Volume_Ratio", np.nan)) if pd.notna(t.get("Volume_Ratio", np.nan)) else np.nan
+    rsi = float(t.get("RSI14", np.nan)) if pd.notna(t.get("RSI14", np.nan)) else np.nan
+    resistance = float(t.get("Resistance20", np.nan)) if pd.notna(t.get("Resistance20", np.nan)) else np.nan
+    support = float(t.get("Support20", np.nan)) if pd.notna(t.get("Support20", np.nan)) else np.nan
+
+    # Trend dan range historis.
+    tail10 = z.tail(min(10, len(z)))
+    tail5 = z.tail(min(5, len(z)))
+    range10 = ((tail10["High"].max() - tail10["Low"].min()) /
+               max(float(tail10["Close"].mean()), 1e-9) * 100) if "High" in z.columns and "Low" in z.columns else np.nan
+    price_slope = ((float(tail5["Close"].iloc[-1]) / float(tail5["Close"].iloc[0])) - 1) * 100 if len(tail5) >= 2 else 0.0
+
+    # Konsistensi volume 5 hari.
+    vr = pd.to_numeric(z.get("Volume_Ratio", pd.Series(index=z.index, dtype=float)), errors="coerce").tail(5).dropna()
+    vol_rising = len(vr) >= 4 and vr.iloc[-1] > vr.iloc[0] * 1.25 and vr.diff().mean() > 0
+    volume_spike = np.isfinite(vol) and vol >= 2.0
+
+    # Posisi terhadap resistance/support.
+    near_res = np.isfinite(resistance) and resistance > 0 and abs(close / resistance - 1) <= 0.025
+    near_sup = np.isfinite(support) and support > 0 and abs(close / support - 1) <= 0.025
+    breakout = np.isfinite(resistance) and resistance > 0 and close > resistance
+    breakdown = np.isfinite(support) and support > 0 and close < support
+
+    # Rejection di resistance/support: menyentuh area tetapi close kembali.
+    resistance_rejection = (mover_type == "Gainer" and np.isfinite(resistance) and resistance > 0
+                            and "High" in z.columns and float(t["High"]) >= resistance
+                            and close < resistance and ret < 0)
+    support_rejection = (mover_type == "Loser" and np.isfinite(support) and support > 0
+                         and "Low" in z.columns and float(t["Low"]) <= support
+                         and close > support and ret > 0)
+
+    # Distribusi/akumulasi proxy berbasis price-volume ketika broker belum tersedia.
+    red_vol = False
+    green_vol = False
+    if len(tail5) >= 3 and "Volume_Ratio" in tail5.columns and "Return_%" in tail5.columns:
+        red_vol = bool(((tail5["Return_%"] < 0) & (tail5["Volume_Ratio"] >= 1.5)).sum() >= 2)
+        green_vol = bool(((tail5["Return_%"] > 0) & (tail5["Volume_Ratio"] >= 1.5)).sum() >= 2)
+
+    if mover_type == "Gainer":
+        if breakout:
+            return "BREAKOUT / TOP GAINER", f"Close {close:,.0f} berada di atas resistance {resistance:,.0f}."
+        if resistance_rejection:
+            return "RESISTANCE REJECTION", "Harga sempat menguji resistance tetapi close kembali di bawah area tersebut."
+        if near_res:
+            return "RESISTANCE TEST", f"Harga berada sekitar {abs(close/resistance-1)*100:.2f}% dari resistance."
+        if volume_spike:
+            return "VOLUME SPIKE", f"Volume Ratio {vol:.2f}× MA20 menunjukkan lonjakan aktivitas."
+        if vol_rising and green_vol:
+            return "VOLUME EXPANSION / ACCUMULATION", "Volume meningkat konsisten dan kenaikan harga mendapat dukungan aktivitas."
+        if price_slope > 2 and (not np.isfinite(rsi) or rsi < 75):
+            return "MOMENTUM BUILDING", f"Harga menguat sekitar {price_slope:+.2f}% dalam 5 hari terakhir."
+        if np.isfinite(range10) and range10 < 8:
+            return "SWING / CONSOLIDATION", f"Harga masih bergerak dalam range ±{range10:.2f}% selama sekitar 10 hari."
+        return "ACCUMULATION WATCH", "Belum ada breakout yang jelas; price action masih menunjukkan fase persiapan/akumulasi."
+    else:
+        if breakdown:
+            return "BREAKDOWN / TOP LOSER", f"Close {close:,.0f} berada di bawah support {support:,.0f}."
+        if support_rejection:
+            return "SUPPORT REJECTION", "Harga menembus area support intraday tetapi berhasil ditutup kembali di atasnya."
+        if near_sup:
+            return "SUPPORT TEST", f"Harga berada sekitar {abs(close/support-1)*100:.2f}% dari support."
+        if volume_spike:
+            return "SELLING VOLUME SPIKE", f"Volume Ratio {vol:.2f}× MA20 menunjukkan lonjakan aktivitas jual."
+        if vol_rising and red_vol:
+            return "VOLUME DISTRIBUTION", "Volume meningkat konsisten bersamaan dengan tekanan harga negatif."
+        if price_slope < -2 and (not np.isfinite(rsi) or rsi > 25):
+            return "MOMENTUM WEAKENING", f"Harga melemah sekitar {price_slope:+.2f}% dalam 5 hari terakhir."
+        if np.isfinite(range10) and range10 < 8:
+            return "SWING / CONSOLIDATION", f"Harga masih bergerak dalam range ±{range10:.2f}% selama sekitar 10 hari."
+        return "DISTRIBUTION WATCH", "Belum ada breakdown yang jelas; tekanan jual masih perlu dikonfirmasi history berikutnya."
+
+
+def idx_market_phase(hist, mover_type):
+    return _idx_phase_details(hist, mover_type)[0]
+
+
+def idx_phase_event_text(hist, mover_type):
+    return _idx_phase_details(hist, mover_type)[1]
+
+
+def _idx_phase_style(phase):
+    """Warna teks khusus untuk timeline. Tidak memberi background per baris."""
+    p = str(phase).upper()
+    # Hanya warna tulisan agar tabel tetap ringan dan mudah dibaca.
+    if "TOP GAINER" in p or "BREAKOUT" in p:
+        return "color:#22c55e;font-weight:700;"
+    if "TOP LOSER" in p or "BREAKDOWN" in p:
+        return "color:#ef4444;font-weight:700;"
+    if "VOLUME SPIKE" in p or "SELLING VOLUME SPIKE" in p:
+        return "color:#f97316;font-weight:700;"
+    if "VOLUME EXPANSION" in p:
+        return "color:#06b6d4;font-weight:700;"
+    if "ACCUMULATION" in p:
+        return "color:#22c55e;font-weight:700;"
+    if "DISTRIBUTION" in p:
+        return "color:#f43f5e;font-weight:700;"
+    if "RESISTANCE" in p:
+        return "color:#eab308;font-weight:700;"
+    if "SUPPORT" in p:
+        return "color:#60a5fa;font-weight:700;"
+    if "MOMENTUM" in p:
+        return "color:#a78bfa;font-weight:700;"
+    if "SWING" in p or "CONSOLIDATION" in p:
+        return "color:#94a3b8;font-weight:700;"
+    return "color:#cbd5e1;"
+
+
+def idx_fundamental_snapshot(ticker):
+    try:
+        info=yf.Ticker(ticker.upper().replace(".JK","")+".JK").get_info()
+        mapping={
+            "Trailing PE":"trailingPE","Price/Book":"priceToBook","ROE":"returnOnEquity",
+            "ROA":"returnOnAssets","Debt/Equity":"debtToEquity","Revenue Growth":"revenueGrowth",
+            "Earnings Growth":"earningsGrowth","Profit Margin":"profitMargins","Market Cap":"marketCap",
+        }
+        out=[]
+        for label,key in mapping.items():
+            v=info.get(key,np.nan)
+            if v is not None:
+                try: v=float(v)
+                except: pass
+            out.append({"Metric":label,"Value":v})
+        return pd.DataFrame(out)
+    except Exception:
+        return pd.DataFrame(columns=["Metric","Value"])
+
+
+def idx_make_excel(mover_rows, loser_rows, hist, broker_df, factor_rows, fundamental_df, ticker):
+    bio=BytesIO()
+    with pd.ExcelWriter(bio, engine="openpyxl") as writer:
+        mover_rows.to_excel(writer,index=False,sheet_name="Top_Gainer")
+        loser_rows.to_excel(writer,index=False,sheet_name="Top_Loser")
+        hist.reset_index(names="Date").to_excel(writer,index=False,sheet_name="Price_History")
+        factor_rows.to_excel(writer,index=False,sheet_name="Factor_Analysis")
+        if broker_df.empty:
+            pd.DataFrame(columns=["Date","Ticker","Broker","Buy Value","Sell Value","Net Value","Status"]).to_excel(writer,index=False,sheet_name="Broker_Daily")
+        else:
+            broker_df[broker_df["Ticker"]==ticker].to_excel(writer,index=False,sheet_name="Broker_Daily")
+            broker_df[broker_df["Ticker"]==ticker].groupby("Broker",as_index=False)["Net Value"].sum().sort_values("Net Value",ascending=False).to_excel(writer,index=False,sheet_name="Broker_Accumulation")
+        fundamental_df.to_excel(writer,index=False,sheet_name="Fundamental")
+        wb=writer.book
+        from openpyxl.styles import Font, PatternFill, Alignment
+        for ws in wb.worksheets:
+            ws.freeze_panes="A2"
+            ws.auto_filter.ref=ws.dimensions
+            for cell in ws[1]:
+                cell.font=Font(bold=True)
+                cell.alignment=Alignment(horizontal="center")
+            for col in ws.columns:
+                letter=col[0].column_letter
+                ws.column_dimensions[letter].width=min(max(max(len(str(c.value or "")) for c in col)+2,10),35)
+    bio.seek(0)
+    return bio.getvalue()
+
+
+def idx_auto_mover_type(hist):
+    """Arah story hari ini: Gainer/Bullish atau Loser/Bearish.
+    Ini bukan klaim ranking market-wide; ranking tidak ditampilkan di modul ini.
+    """
+    if hist is None or hist.empty or "Close" not in hist.columns or len(hist) < 2:
+        return "Gainer"
+    last = pd.to_numeric(hist["Close"].iloc[-1], errors="coerce")
+    prev = pd.to_numeric(hist["Close"].iloc[-2], errors="coerce")
+    if pd.notna(last) and pd.notna(prev) and prev != 0:
+        return "Gainer" if last >= prev else "Loser"
+    return "Gainer"
+
+
+def _idx_story_summary(story, mover_type, ticker):
+    """Ringkasan perjalanan H-20 -> H0, berdasarkan perubahan history."""
+    if story.empty:
+        return "History belum cukup."
+    x = story.copy()
+    close = pd.to_numeric(x["Close"], errors="coerce").dropna()
+    vol = pd.to_numeric(x.get("Volume_Ratio", pd.Series(index=x.index, dtype=float)), errors="coerce")
+    ret = pd.to_numeric(x.get("Return_%", pd.Series(index=x.index, dtype=float)), errors="coerce")
+    parts = []
+
+    if len(close) >= 10:
+        first10 = close.iloc[:10]
+        last10 = close.iloc[-10:]
+        r1 = (first10.max() - first10.min()) / max(first10.mean(), 1e-9) * 100
+        r2 = (last10.max() - last10.min()) / max(last10.mean(), 1e-9) * 100
+        if r1 < 8 and r2 < 8:
+            parts.append("sebelumnya bergerak dalam range/swing relatif rapat")
+        elif mover_type == "Gainer" and last10.iloc[-1] > last10.iloc[0]:
+            parts.append("kemudian mulai membentuk penguatan harga")
+        elif mover_type == "Loser" and last10.iloc[-1] < last10.iloc[0]:
+            parts.append("kemudian mulai membentuk pelemahan harga")
+
+    vv = vol.dropna()
+    if len(vv) >= 5:
+        first = float(vv.iloc[0]); last = float(vv.iloc[-1])
+        if last > first * 1.35:
+            parts.append(f"volume meningkat dari sekitar {first:.2f}× menjadi {last:.2f}× MA20")
+        elif last < first * 0.75:
+            parts.append(f"volume menurun dari sekitar {first:.2f}× menjadi {last:.2f}× MA20")
+
+    rr = ret.dropna().tail(5)
+    if len(rr) >= 4:
+        if mover_type == "Gainer" and (rr > 0).sum() >= 3:
+            parts.append(f"{int((rr > 0).sum())} dari {len(rr)} hari terakhir ditutup positif")
+        elif mover_type == "Loser" and (rr < 0).sum() >= 3:
+            parts.append(f"{int((rr < 0).sum())} dari {len(rr)} hari terakhir ditutup negatif")
+
+    phase_list = [idx_market_phase(story.iloc[:i+1], mover_type) for i in range(len(story))]
+    distinct_phases = []
+    for ph in phase_list:
+        if ph != "DATA TIDAK CUKUP" and (not distinct_phases or ph != distinct_phases[-1]):
+            distinct_phases.append(ph)
+    if distinct_phases:
+        parts.append("alur fase: " + " → ".join(distinct_phases[-6:]))
+
+    if not parts:
+        return f"History {ticker} belum menunjukkan pola dominan yang cukup kuat."
+    if len(parts) == 1:
+        return f"Dalam ±20 hari perdagangan, {ticker} {parts[0]}."
+    return f"Dalam ±20 hari perdagangan, {ticker} {', '.join(parts[:-1])}, dan {parts[-1]}."
+
+
 def render_idx_sector_module():
     st.markdown("## 🇮🇩 SEKTORAL IDX")
-    st.caption("Kondisi 11 sektor IDX-IC. Data ditampilkan sebagai market overview, bukan hasil perhitungan seasonality.")
+    st.caption("Analisa emiten berbasis perjalanan H-20 → H0. Tidak lagi menampilkan daftar Top Gainer/Top Loser; cukup masukkan kode emiten di sebelah kiri.")
 
+    # Ringkasan sektor tetap ada sebagai konteks market.
     sectors = idx_get_all_sectors()
     valid = [x for x in sectors if pd.notna(x["change"])]
     ihsg = idx_get_ihsg_overview()
-
     if valid:
-        best=max(valid,key=lambda x:x["change"])
-        worst=min(valid,key=lambda x:x["change"])
-        avg=float(np.mean([x["change"] for x in valid]))
-        a,b,c,d=st.columns(4)
-        a.metric("IHSG", f'{ihsg["price"]:,.2f}' if np.isfinite(ihsg["price"]) else "N/A",
-                 f'{ihsg["change"]:+.2f}%' if np.isfinite(ihsg["change"]) else None)
+        best = max(valid, key=lambda x: x["change"])
+        worst = min(valid, key=lambda x: x["change"])
+        avg = float(np.mean([x["change"] for x in valid]))
+        a,b,c,d = st.columns(4)
+        a.metric("IHSG", f'{ihsg["price"]:,.2f}' if np.isfinite(ihsg["price"]) else "N/A", f'{ihsg["change"]:+.2f}%' if np.isfinite(ihsg["change"]) else None)
         b.metric("Sektor Terkuat", best["full_name"], f'{best["change"]:+.2f}%')
         c.metric("Sektor Terlemah", worst["full_name"], f'{worst["change"]:+.2f}%')
         d.metric("Rata-rata 11 Sektor", f"{avg:+.2f}%")
-    else:
-        st.warning("Data sektor IDX belum berhasil dibaca dari sumber data.")
-        if np.isfinite(ihsg["price"]):
-            st.metric("IHSG", f'{ihsg["price"]:,.2f}',
-                      f'{ihsg["change"]:+.2f}%' if np.isfinite(ihsg["change"]) else None)
-
-    st.markdown("### 📊 Kondisi Sektor Hari Ini")
-    for start in range(0,len(sectors),3):
-        cols=st.columns(3,gap="medium")
-        for col,data in zip(cols,sectors[start:start+3]):
-            with col:
-                with st.container(border=True):
-                    st.markdown(f"### {data['icon']} {data['name']}")
-                    st.caption(f"{data['full_name']} • {data['symbol']}")
-                    if pd.notna(data["change"]):
-                        st.metric("Perubahan 1D", f'{data["change"]:+.2f}%',
-                                  delta=f'{data["change"]:+.2f}%')
-                    else:
-                        st.metric("Perubahan 1D","N/A")
-                    if pd.notna(data["price"]):
-                        st.caption(f'Index: {data["price"]:,.2f}')
-                    else:
-                        st.caption(f'Status data: {data["status"]}')
-                    if st.button("Lihat sumber", key=f"idx_src_{data['code']}", use_container_width=True):
-                        st.markdown(f'[{data["url"]}]({data["url"]})')
 
     st.divider()
-    st.caption("Sumber data sektoral: Investing.com • Refresh cache sekitar 5 menit.")
 
+    # =====================================================
+    # INPUT EMITEN: SATU-SATUNYA DI SIDEBAR
+    # =====================================================
+    ticker_input = str(globals().get("ticker_input", "")).upper().replace(".JK", "").strip()
+    if not ticker_input:
+        st.info("Masukkan kode emiten pada sidebar sebelah kiri.")
+        return
+
+    with st.spinner(f"Mengambil history {ticker_input}..."):
+        hist = idx_history(ticker_input, days=80)
+
+    if hist.empty:
+        st.error(f"Data history {ticker_input} tidak ditemukan. Pastikan kode emiten benar.")
+        return
+
+    story = hist.tail(20).copy()
+    selected_type = idx_auto_mover_type(hist)
+    mover_label = "TOP GAINER / BULLISH" if selected_type == "Gainer" else "TOP LOSER / BEARISH"
+    mover_icon = "🟢" if selected_type == "Gainer" else "🔴"
+    t = story.iloc[-1]
+
+    st.markdown(f"### {mover_icon} {ticker_input} — {mover_label}")
+    st.caption(f"{_idx_name_from_master(ticker_input)} • {_idx_sector_from_master(ticker_input)}")
+    m1,m2,m3,m4,m5 = st.columns(5)
+    m1.metric("Close", f"{t['Close']:,.0f}", f"{t.get('Return_%',np.nan):+.2f}%" if np.isfinite(t.get('Return_%',np.nan)) else None)
+    m2.metric("Volume Ratio", f"{t.get('Volume_Ratio',np.nan):.2f}×" if np.isfinite(t.get('Volume_Ratio',np.nan)) else "N/A")
+    m3.metric("RSI 14", f"{t.get('RSI14',np.nan):.1f}" if np.isfinite(t.get('RSI14',np.nan)) else "N/A")
+    m4.metric("ATR %", f"{t.get('ATR_%',np.nan):.2f}%" if np.isfinite(t.get('ATR_%',np.nan)) else "N/A")
+    m5.metric("Phase", idx_market_phase(story, selected_type))
+
+    # Broker opsional; tidak ditampilkan sebagai kewajiban.
+    st.divider()
+    with st.expander("🏦 Broker Summary — opsional", expanded=False):
+        st.caption("Upload CSV/XLSX hasil copy/export Broker Summary Stockbit/Ajaib. Tanpa file broker, analisa tetap berjalan.")
+        uploaded = st.file_uploader("Broker Summary CSV/XLSX", type=["csv","xlsx"], key="idx_broker_upload")
+        broker_df = idx_load_broker(uploaded) if uploaded else pd.DataFrame()
+        if broker_df.empty:
+            st.info("Broker data belum dimasukkan. Faktor broker tidak digunakan.")
+        else:
+            st.success(f"Broker data terbaca: {len(broker_df):,} baris | {broker_df['Date'].min().date()} s/d {broker_df['Date'].max().date()}")
+
+    st.divider()
+    st.subheader(f"🧠 ANALISA TREND — {ticker_input}")
+    st.markdown(f"**Klasifikasi pergerakan hari ini: {mover_icon} {mover_label}**")
+    st.info(_idx_story_summary(story, selected_type, ticker_input))
+
+    # =====================================================
+    # TIMELINE H-20 -> H0
+    # =====================================================
+    st.markdown("### 🧭 Perjalanan H-20 → H0")
+    phases = [idx_market_phase(story.iloc[:i+1], selected_type) for i in range(len(story))]
+    events = [idx_phase_event_text(story.iloc[:i+1], selected_type) for i in range(len(story))]
+    story_display = story.reset_index().copy()
+    story_display["Phase"] = phases
+    story_display["Keterangan"] = events
+    cols = ["Date","Open","High","Low","Close","Return_%","Volume","Volume_Ratio","RSI14","ATR_%","MA20","MA50","Resistance20","Support20","Phase","Keterangan"]
+    cols = [c for c in cols if c in story_display.columns]
+    fmt = {
+        "Open":"{:,.0f}","High":"{:,.0f}","Low":"{:,.0f}","Close":"{:,.0f}",
+        "Return_%":"{:+.2f}%","Volume":"{:,.0f}","Volume_Ratio":"{:.2f}×",
+        "RSI14":"{:.1f}","ATR_%":"{:.2f}%","MA20":"{:,.0f}","MA50":"{:,.0f}",
+        "Resistance20":"{:,.0f}","Support20":"{:,.0f}"
+    }
+    styler = story_display[cols].style.format({k:v for k,v in fmt.items() if k in story_display.columns})
+    # Hanya warna teks Phase dan Keterangan agar timeline tidak menjadi blok-blok warna.
+    def _row_phase_style(row):
+        style = pd.Series("", index=row.index)
+        phase_css = _idx_phase_style(row.get("Phase", ""))
+        style["Phase"] = phase_css
+        style["Keterangan"] = phase_css
+        return style
+    styler = styler.apply(_row_phase_style, axis=1)
+    styler = styler.set_properties(subset=["Keterangan"], **{"text-align":"left", "min-width":"320px"})
+    st.dataframe(styler, use_container_width=True, hide_index=True)
+    st.caption("Warna fase: 🟩 breakout/gainer • 🟥 breakdown/loser/distribution • 🟧 volume spike • 🟨 resistance • 🟦 support • 🟪 momentum • ⬜ swing/consolidation.")
+
+    # =====================================================
+    # FAKTOR DINAMIS
+    # =====================================================
+    factors, conclusion = idx_factor_story(story, broker_df, ticker_input, selected_type)
+    st.markdown("### 🔥 Faktor yang Paling Berpengaruh")
+    if factors:
+        for i,(name,score,evidence) in enumerate(factors[:8],1):
+            prefix = "🔥" if i <= 3 else "🟢"
+            st.markdown(f"{prefix} **{name} — Score {score}/100**  \n{evidence}")
+    else:
+        st.info("Belum ada faktor dominan yang cukup kuat. Jangan memaksakan kesimpulan dari satu indikator.")
+
+    st.markdown("### 📌 Kesimpulan Mengapa Menjadi Gainer / Loser")
+    st.info(conclusion)
+
+    # Broker history bila file diberikan.
+    b = idx_broker_for_ticker(broker_df, ticker_input, t.name)
+    if not b.empty:
+        st.markdown("### 🏦 Broker History — ±20 Hari")
+        b20 = b[b["Date"] >= pd.Timestamp(t.name)-pd.Timedelta(days=30)].copy()
+        topb = b20.groupby("Broker",as_index=False)["Net Value"].sum().sort_values("Net Value",ascending=False)
+        st.dataframe(topb.head(10).style.format({"Net Value":"{:,.0f}"}), use_container_width=True, hide_index=True)
+        st.caption("Net Value = Buy Value − Sell Value. Positif = akumulasi, negatif = distribusi.")
+
+    st.markdown("### 📊 Fundamental Snapshot")
+    fundamental = idx_fundamental_snapshot(ticker_input)
+    if fundamental.empty:
+        st.info("Fundamental dari Yahoo Finance tidak tersedia untuk emiten ini.")
+    else:
+        st.dataframe(fundamental, use_container_width=True, hide_index=True)
+
+    # Download hanya untuk emiten yang sedang dianalisis.
+    factor_df = pd.DataFrame(factors, columns=["Factor","Score","Evidence"])
+    excel_bytes = idx_make_excel(pd.DataFrame(), pd.DataFrame(), hist, broker_df, factor_df, fundamental, ticker_input)
+    st.download_button(
+        "📥 Download Excel — History + Faktor + Broker + Fundamental",
+        data=excel_bytes,
+        file_name=f"IDX_Analysis_{ticker_input}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+        key="idx_download_analysis"
+    )
 
 # =========================================================
 # UNIFIED SIDEBAR
@@ -5658,23 +6485,6 @@ else:
     st.sidebar.caption("📍 Panel indikator muncul di bawah Price Action.")
 
     analyze = True
-
-
-# =========================================================
-# STOCK HEADER
-# =========================================================
-
-if ticker_input and not analysis_mode.startswith("🇮🇩"):
-    stock_rows = master[master["Ticker"] == ticker_input]
-    if not stock_rows.empty:
-        stock_info = stock_rows.iloc[0]
-        sektor = stock_info["Sektor"] if "Sektor" in master.columns else "-"
-        sub_sektor = stock_info["Sub Sektor"] if "Sub Sektor" in master.columns else "-"
-        st.subheader(f"{ticker_input}  |  {sektor}")
-        st.caption(
-            f"{sub_sektor}  •  "
-            f"{'Screening' if analysis_mode.startswith('📅') else 'Sektoral IDX' if analysis_mode.startswith('🇮🇩') else 'Statistical Discovery' if analysis_mode.startswith('🔬') else 'Technical Analysis'}"
-        )
 
 
 
