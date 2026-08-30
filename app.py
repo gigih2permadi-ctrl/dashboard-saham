@@ -5951,6 +5951,27 @@ def idx_factor_story(hist, broker_df, ticker, mover_type):
     if np.isfinite(rsi):
         if mover_type=="Gainer" and rsi>=65: factors.append(("Momentum kuat", 72, f"RSI {rsi:.1f}"))
         elif mover_type=="Loser" and rsi<=35: factors.append(("Momentum bearish", 72, f"RSI {rsi:.1f}"))
+        # Jenuh bukan sinyal reversal otomatis. Nilai RSI harus dibaca bersama
+        # arah RSI, trend harga, dan posisi terhadap MA20. RSI >70 yang terus naik
+        # pada trend bullish dapat berarti momentum sangat kuat, bukan tanda wajib turun.
+        rsi_tail = pd.to_numeric(x.get("RSI14", pd.Series(index=x.index, dtype=float)), errors="coerce").dropna()
+        rsi_delta = float(rsi_tail.iloc[-1] - rsi_tail.iloc[-4]) if len(rsi_tail) >= 4 else np.nan
+        price_up = bool(np.isfinite(ma20) and np.isfinite(close) and close > ma20) if 'ma20' in locals() else False
+        price_down = bool(np.isfinite(ma20) and np.isfinite(close) and close < ma20) if 'ma20' in locals() else False
+        if rsi>=70:
+            if np.isfinite(rsi_delta) and rsi_delta > 2 and price_up:
+                factors.append(("Overbought + momentum kuat", 78, f"RSI {rsi:.1f} masih naik ({rsi_tail.iloc[-4]:.1f} → {rsi:.1f}) dan harga di atas MA20 (jenuh beli belum berarti reversal; tren masih kuat)"))
+            elif np.isfinite(rsi_delta) and rsi_delta < -2:
+                factors.append(("Overbought + momentum melemah", 82, f"RSI {rsi:.1f} mulai turun ({rsi_tail.iloc[-4]:.1f} → {rsi:.1f}) (jenuh beli disertai pelemahan momentum; risiko pullback meningkat)"))
+            else:
+                factors.append(("Overbought / Momentum tinggi", 70, f"RSI {rsi:.1f} ≥ 70 (momentum sudah tinggi; jenuh beli bukan sinyal reversal otomatis)"))
+        elif rsi<=30:
+            if np.isfinite(rsi_delta) and rsi_delta < -2 and price_down:
+                factors.append(("Oversold + downtrend kuat", 78, f"RSI {rsi:.1f} masih turun ({rsi_tail.iloc[-4]:.1f} → {rsi:.1f}) dan harga di bawah MA20 (jenuh jual belum berarti rebound)"))
+            elif np.isfinite(rsi_delta) and rsi_delta > 2:
+                factors.append(("Oversold + momentum rebound", 82, f"RSI {rsi:.1f} mulai naik ({rsi_tail.iloc[-4]:.1f} → {rsi:.1f}) (tekanan jual mulai mereda; rebound mulai terindikasi)"))
+            else:
+                factors.append(("Oversold / Momentum rendah", 70, f"RSI {rsi:.1f} ≤ 30 (tekanan ekstrem; oversold bukan sinyal rebound otomatis)"))
     ma20=today.get("MA20",np.nan); ma50=today.get("MA50",np.nan); close=today.get("Close",np.nan)
     if np.isfinite(ma20) and np.isfinite(close):
         if mover_type=="Gainer" and close>ma20: factors.append(("Trend di atas MA20", 62, f"Close {close:.0f} > MA20 {ma20:.0f}"))
@@ -5999,22 +6020,21 @@ def idx_factor_story(hist, broker_df, ticker, mover_type):
 
 
 def _idx_phase_details(x, mover_type):
-    """Menentukan fase berdasarkan price action + volume secara konservatif.
+    """Membaca fase harian secara ringkas dari price action + volume.
 
-    Prinsip penting:
-    - Volume tinggi TIDAK otomatis berarti jual/distribusi.
-    - Arah volume dibaca dari candle (Close vs Open) dan price action.
-    - Breakout hanya disebut confirmed jika CLOSE berada di atas resistance.
-    - Jika High menembus resistance tetapi CLOSE masih di bawahnya, disebut
-      resistance test / bullish attempt, bukan breakout.
-    - Catatan fase menjelaskan alasan dalam kurung agar mudah dibaca.
+    Catatan penting:
+    - Volume tinggi tidak otomatis berarti jual.
+    - Arah candle membantu membaca konteks bullish/bearish.
+    - Breakout hanya confirmed jika CLOSE melewati resistance.
+    - Broker/akumulasi broker tidak disimpulkan dari OHLCV.
+    - RSI overbought/oversold adalah kondisi momentum, bukan sinyal reversal otomatis.
     """
     if x is None or x.empty or "Close" not in x.columns:
-        return "DATA TIDAK CUKUP", "History belum cukup untuk membaca fase."
+        return "DATA TIDAK CUKUP", "History belum cukup."
 
     z = x.dropna(subset=["Close"]).copy()
     if len(z) < 5:
-        return "DATA TIDAK CUKUP", "History belum cukup untuk membaca fase."
+        return "DATA TIDAK CUKUP", "History belum cukup."
 
     t = z.iloc[-1]
     close = float(t["Close"])
@@ -6027,11 +6047,10 @@ def _idx_phase_details(x, mover_type):
     resistance = float(t.get("Resistance20", np.nan)) if pd.notna(t.get("Resistance20", np.nan)) else np.nan
     support = float(t.get("Support20", np.nan)) if pd.notna(t.get("Support20", np.nan)) else np.nan
 
-    # Karakter candle. Ini penting agar volume tidak salah dibaca sebagai jual.
     candle_bull = bool(np.isfinite(open_price) and close > open_price)
     candle_bear = bool(np.isfinite(open_price) and close < open_price)
     candle_flat = not candle_bull and not candle_bear
-    candle_word = "candle bullish" if candle_bull else ("candle bearish" if candle_bear else "candle relatif netral")
+    candle_word = "bullish" if candle_bull else ("bearish" if candle_bear else "netral")
 
     tail10 = z.tail(min(10, len(z)))
     tail5 = z.tail(min(5, len(z)))
@@ -6039,199 +6058,118 @@ def _idx_phase_details(x, mover_type):
                max(float(tail10["Close"].mean()), 1e-9) * 100) if "High" in z.columns and "Low" in z.columns else np.nan
     price_slope = ((float(tail5["Close"].iloc[-1]) / max(float(tail5["Close"].iloc[0]), 1e-9)) - 1) * 100 if len(tail5) >= 2 else 0.0
 
-    vr = pd.to_numeric(z.get("Volume_Ratio", pd.Series(index=z.index, dtype=float)), errors="coerce").tail(5).dropna()
+    vr_all = pd.to_numeric(z.get("Volume_Ratio", pd.Series(index=z.index, dtype=float)), errors="coerce")
+    vr = vr_all.tail(5).dropna()
     vol_rising = len(vr) >= 4 and vr.iloc[-1] > vr.iloc[0] * 1.25 and vr.diff().mean() > 0
     volume_spike = np.isfinite(vol) and vol >= 2.0
+
+    # Selalu tampilkan arah perubahan volume harian jika tersedia.
+    if len(vr) >= 2:
+        v_prev, v_now = float(vr.iloc[-2]), float(vr.iloc[-1])
+        if v_now > v_prev * 1.05:
+            vol_note = f"Vol naik {v_prev:.2f}×→{v_now:.2f}×"
+        elif v_now < v_prev * 0.95:
+            vol_note = f"Vol turun {v_prev:.2f}×→{v_now:.2f}×"
+        else:
+            vol_note = f"Vol stabil {v_now:.2f}×"
+    elif np.isfinite(vol):
+        vol_note = f"Vol {vol:.2f}×"
+    else:
+        vol_note = "Vol N/A"
 
     near_res = np.isfinite(resistance) and resistance > 0 and abs(close / resistance - 1) <= 0.025
     near_sup = np.isfinite(support) and support > 0 and abs(close / support - 1) <= 0.025
     close_breakout = np.isfinite(resistance) and resistance > 0 and close > resistance
     close_breakdown = np.isfinite(support) and support > 0 and close < support
+    resistance_intraday_test = np.isfinite(resistance) and resistance > 0 and np.isfinite(high) and high >= resistance and close <= resistance
+    support_intraday_test = np.isfinite(support) and support > 0 and np.isfinite(low) and low <= support and close >= support
+    resistance_rejection = resistance_intraday_test and candle_bear and close < resistance
+    support_rejection = support_intraday_test and candle_bull and close > support
 
-    # Intraday test: high/low melewati level tetapi close belum mengonfirmasi.
-    resistance_intraday_test = (
-        np.isfinite(resistance) and resistance > 0 and np.isfinite(high)
-        and high >= resistance and close <= resistance
-    )
-    support_intraday_test = (
-        np.isfinite(support) and support > 0 and np.isfinite(low)
-        and low <= support and close >= support
-    )
+    # RSI regime: singkat dan tidak menganggap OB/OS sebagai reversal otomatis.
+    rsi_tail = pd.to_numeric(z.get("RSI14", pd.Series(index=z.index, dtype=float)), errors="coerce").dropna()
+    rsi_delta = float(rsi_tail.iloc[-1] - rsi_tail.iloc[-4]) if len(rsi_tail) >= 4 else np.nan
+    ma20_now = float(t.get("MA20", np.nan)) if pd.notna(t.get("MA20", np.nan)) else np.nan
+    trend_up = np.isfinite(ma20_now) and close > ma20_now and price_slope > 0
+    trend_down = np.isfinite(ma20_now) and close < ma20_now and price_slope < 0
+    rsi_note = ""
+    if np.isfinite(rsi):
+        if rsi >= 70:
+            if np.isfinite(rsi_delta) and rsi_delta > 2 and trend_up:
+                rsi_note = f"RSI {rsi:.1f} OB, masih naik → momentum kuat"
+            elif np.isfinite(rsi_delta) and rsi_delta < -2:
+                rsi_note = f"RSI {rsi:.1f} OB, mulai turun → waspada pullback"
+            else:
+                rsi_note = f"RSI {rsi:.1f} OB → momentum tinggi"
+        elif rsi <= 30:
+            if np.isfinite(rsi_delta) and rsi_delta > 2:
+                rsi_note = f"RSI {rsi:.1f} OS, mulai naik → rebound terindikasi"
+            elif np.isfinite(rsi_delta) and rsi_delta < -2 and trend_down:
+                rsi_note = f"RSI {rsi:.1f} OS, masih turun → downtrend kuat"
+            else:
+                rsi_note = f"RSI {rsi:.1f} OS → tekanan jual tinggi"
 
-    # Rejection keras: level ditembus intraday, lalu close kembali berlawanan
-    # dengan arah breakout. Tidak mensyaratkan return negatif/positif karena
-    # candle intraday dan posisi close terhadap level sudah lebih informatif.
-    resistance_rejection = (
-        resistance_intraday_test and candle_bear and
-        np.isfinite(close) and close < resistance
-    )
-    support_rejection = (
-        support_intraday_test and candle_bull and
-        np.isfinite(close) and close > support
-    )
+    def note(*parts):
+        parts = [str(v).strip() for v in parts if v and str(v).strip()]
+        return " (" + "; ".join(parts) + ")" if parts else ""
 
-    # Distribusi/akumulasi hanya sebagai proxy price-volume. Ini BUKAN klaim
-    # broker/bandar; broker hanya boleh disimpulkan dari data broker terpisah.
-    red_vol = False
-    green_vol = False
-    if len(tail5) >= 3 and "Volume_Ratio" in tail5.columns and "Return_%" in tail5.columns:
-        red_vol = bool(((tail5["Return_%"] < 0) & (tail5["Volume_Ratio"] >= 1.5)).sum() >= 2)
-        green_vol = bool(((tail5["Return_%"] > 0) & (tail5["Volume_Ratio"] >= 1.5)).sum() >= 2)
-
+    # ============================ BULLISH / GAINER ============================
     if mover_type == "Gainer":
-        # 1) Close di atas resistance = breakout terkonfirmasi.
         if close_breakout:
-            return (
-                "BREAKOUT / TOP GAINER",
-                f"Close {close:,.0f} berada di atas resistance {resistance:,.0f} "
-                f"({candle_word}; breakout terkonfirmasi oleh closing price)."
-            )
+            return "BREAKOUT / TOP GAINER", f"Close {close:,.0f} > resistance {resistance:,.0f}.{note(candle_word, 'breakout confirmed', vol_note, rsi_note)}"
 
-        # 2) High menembus resistance tetapi close belum di atasnya.
-        # Ini tepat untuk kasus seperti MITI 27 Agustus: bullish kuat,
-        # high melewati resistance, tetapi close kembali di bawah resistance.
         if resistance_intraday_test:
-            dist = abs(close / resistance - 1) * 100 if resistance else np.nan
             if resistance_rejection:
-                return (
-                    "RESISTANCE REJECTION",
-                    f"High {high:,.0f} sempat melewati resistance {resistance:,.0f}, "
-                    f"tetapi close {close:,.0f} kembali di bawahnya "
-                    f"({candle_word}; breakout belum terkonfirmasi)."
-                )
-            return (
-                "RESISTANCE TEST / BULLISH ATTEMPT",
-                f"High {high:,.0f} sempat melewati resistance {resistance:,.0f}, "
-                f"sedangkan close {close:,.0f} masih di bawahnya "
-                f"({candle_word}, return {ret:+.2f}% jika tersedia; breakout belum terkonfirmasi)."
-            )
+                return "RESISTANCE REJECTION", f"High {high:,.0f} > res {resistance:,.0f}; close {close:,.0f} di bawah.{note(candle_word, 'breakout belum confirmed', vol_note, rsi_note)}"
+            ret_note = f"ret {ret:+.2f}%" if np.isfinite(ret) else ""
+            return "RESISTANCE TEST / BULLISH ATTEMPT", f"High {high:,.0f} > res {resistance:,.0f}; close {close:,.0f}.{note(candle_word, ret_note, 'breakout belum confirmed', vol_note, rsi_note)}"
 
-        # 3) Dekat resistance tetapi belum menyentuh intraday.
         if near_res:
             dist = abs(close / resistance - 1) * 100
-            return (
-                "RESISTANCE TEST",
-                f"Harga berada sekitar {dist:.2f}% dari resistance "
-                f"({candle_word}; area supply sedang diuji)."
-            )
+            return "RESISTANCE TEST", f"Harga {dist:.2f}% dari resistance.{note(candle_word, 'supply diuji', vol_note, rsi_note)}"
 
-        # 4) Volume spike HARUS diberi arah berdasarkan candle.
         if volume_spike:
             if candle_bull:
-                return (
-                    "BULLISH VOLUME SPIKE",
-                    f"Volume Ratio {vol:.2f}× MA20 menunjukkan lonjakan aktivitas "
-                    f"({candle_word}; kenaikan harga mendapat dukungan aktivitas transaksi tinggi)."
-                )
+                return "BULLISH VOLUME SPIKE", f"Volume {vol:.2f}× MA20.{note(candle_word, 'volume spike bullish', vol_note, rsi_note)}"
             if candle_bear:
-                return (
-                    "BEARISH VOLUME SPIKE",
-                    f"Volume Ratio {vol:.2f}× MA20 menunjukkan lonjakan aktivitas "
-                    f"({candle_word}; tekanan jual terlihat dari penurunan close terhadap open)."
-                )
-            return (
-                "HIGH VOLUME / MIXED",
-                f"Volume Ratio {vol:.2f}× MA20 menunjukkan aktivitas sangat tinggi "
-                f"({candle_word}; arah tekanan belum cukup jelas dari candle)."
-            )
+                return "BEARISH VOLUME SPIKE", f"Volume {vol:.2f}× MA20.{note(candle_word, 'tekanan jual meningkat', vol_note, rsi_note)}"
+            return "HIGH VOLUME / MIXED", f"Volume {vol:.2f}× MA20.{note(candle_word, 'arah tekanan belum jelas', vol_note, rsi_note)}"
 
-        if vol_rising and green_vol:
-            return (
-                "VOLUME EXPANSION / ACCUMULATION",
-                f"Volume meningkat konsisten dan kenaikan harga mendapat dukungan aktivitas "
-                f"({candle_word}; ini proxy price-volume, bukan konfirmasi broker)."
-            )
-        if price_slope > 2 and (not np.isfinite(rsi) or rsi < 75):
-            return (
-                "MOMENTUM BUILDING",
-                f"Harga menguat sekitar {price_slope:+.2f}% dalam 5 hari terakhir "
-                f"({candle_word}; momentum jangka pendek menguat)."
-            )
+        if vol_rising:
+            return "VOLUME EXPANSION / ACCUMULATION", f"Volume naik konsisten.{note(candle_word, 'price-volume bullish', vol_note, rsi_note)}"
+        if price_slope > 2:
+            return "MOMENTUM BUILDING", f"Harga {price_slope:+.2f}% dalam 5 hari.{note(candle_word, 'momentum menguat', vol_note, rsi_note)}"
         if np.isfinite(range10) and range10 < 8:
-            return (
-                "SWING / CONSOLIDATION",
-                f"Harga masih bergerak dalam range ±{range10:.2f}% selama sekitar 10 hari "
-                f"({candle_word}; belum ada ekspansi trend yang dominan)."
-            )
-        return (
-            "ACCUMULATION WATCH",
-            f"Belum ada breakout yang jelas "
-            f"({candle_word}; price action masih menunjukkan fase persiapan/akumulasi)."
-        )
+            return "SWING / CONSOLIDATION", f"Range ±{range10:.2f}% selama 10 hari.{note(candle_word, 'trend belum dominan', vol_note, rsi_note)}"
+        return "ACCUMULATION WATCH", f"Belum ada breakout jelas.{note(candle_word, 'fase persiapan', vol_note, rsi_note)}"
 
     # ============================ BEARISH / LOSER ============================
     if close_breakdown:
-        return (
-            "BREAKDOWN / TOP LOSER",
-            f"Close {close:,.0f} berada di bawah support {support:,.0f} "
-            f"({candle_word}; breakdown terkonfirmasi oleh closing price)."
-        )
+        return "BREAKDOWN / TOP LOSER", f"Close {close:,.0f} < support {support:,.0f}.{note(candle_word, 'breakdown confirmed', vol_note, rsi_note)}"
 
     if support_intraday_test:
         if support_rejection:
-            return (
-                "SUPPORT REJECTION",
-                f"Low {low:,.0f} sempat menembus support {support:,.0f}, "
-                f"tetapi close {close:,.0f} kembali di atasnya "
-                f"({candle_word}; breakdown belum terkonfirmasi)."
-            )
-        return (
-            "SUPPORT TEST / BEARISH ATTEMPT",
-            f"Low {low:,.0f} sempat menembus support {support:,.0f}, "
-            f"sedangkan close {close:,.0f} masih di atasnya "
-            f"({candle_word}; breakdown belum terkonfirmasi)."
-        )
+            return "SUPPORT REJECTION", f"Low {low:,.0f} < support {support:,.0f}; close {close:,.0f} di atas.{note(candle_word, 'breakdown belum confirmed', vol_note, rsi_note)}"
+        return "SUPPORT TEST / BEARISH ATTEMPT", f"Low {low:,.0f} < support {support:,.0f}; close {close:,.0f}.{note(candle_word, 'breakdown belum confirmed', vol_note, rsi_note)}"
 
     if near_sup:
         dist = abs(close / support - 1) * 100
-        return (
-            "SUPPORT TEST",
-            f"Harga berada sekitar {dist:.2f}% dari support "
-            f"({candle_word}; area demand sedang diuji)."
-        )
+        return "SUPPORT TEST", f"Harga {dist:.2f}% dari support.{note(candle_word, 'demand diuji', vol_note, rsi_note)}"
 
     if volume_spike:
         if candle_bear:
-            return (
-                "BEARISH VOLUME SPIKE",
-                f"Volume Ratio {vol:.2f}× MA20 menunjukkan lonjakan aktivitas "
-                f"({candle_word}; tekanan jual terlihat dari penurunan close terhadap open)."
-            )
+            return "BEARISH VOLUME SPIKE", f"Volume {vol:.2f}× MA20.{note(candle_word, 'tekanan jual meningkat', vol_note, rsi_note)}"
         if candle_bull:
-            return (
-                "BULLISH VOLUME SPIKE",
-                f"Volume Ratio {vol:.2f}× MA20 menunjukkan lonjakan aktivitas "
-                f"({candle_word}; terdapat rebound/tekanan beli meskipun konteks keseluruhan bearish)."
-            )
-        return (
-            "HIGH VOLUME / MIXED",
-            f"Volume Ratio {vol:.2f}× MA20 menunjukkan aktivitas sangat tinggi "
-            f"({candle_word}; arah tekanan belum cukup jelas dari candle)."
-        )
+            return "BULLISH VOLUME SPIKE", f"Volume {vol:.2f}× MA20.{note(candle_word, 'rebound/tekanan beli', vol_note, rsi_note)}"
+        return "HIGH VOLUME / MIXED", f"Volume {vol:.2f}× MA20.{note(candle_word, 'arah tekanan belum jelas', vol_note, rsi_note)}"
 
-    if vol_rising and red_vol:
-        return (
-            "VOLUME DISTRIBUTION",
-            f"Volume meningkat konsisten bersamaan dengan tekanan harga negatif "
-            f"({candle_word}; proxy price-volume, bukan konfirmasi broker)."
-        )
-    if price_slope < -2 and (not np.isfinite(rsi) or rsi > 25):
-        return (
-            "MOMENTUM WEAKENING",
-            f"Harga melemah sekitar {price_slope:+.2f}% dalam 5 hari terakhir "
-            f"({candle_word}; momentum jangka pendek melemah)."
-        )
+    if vol_rising:
+        return "VOLUME DISTRIBUTION", f"Volume naik konsisten saat harga melemah.{note(candle_word, 'price-volume bearish', vol_note, rsi_note)}"
+    if price_slope < -2:
+        return "MOMENTUM WEAKENING", f"Harga {price_slope:+.2f}% dalam 5 hari.{note(candle_word, 'momentum melemah', vol_note, rsi_note)}"
     if np.isfinite(range10) and range10 < 8:
-        return (
-            "SWING / CONSOLIDATION",
-            f"Harga masih bergerak dalam range ±{range10:.2f}% selama sekitar 10 hari "
-            f"({candle_word}; belum ada ekspansi trend yang dominan)."
-        )
-    return (
-        "DISTRIBUTION WATCH",
-        f"Belum ada breakdown yang jelas "
-        f"({candle_word}; tekanan jual masih perlu dikonfirmasi history berikutnya)."
-    )
+        return "SWING / CONSOLIDATION", f"Range ±{range10:.2f}% selama 10 hari.{note(candle_word, 'trend belum dominan', vol_note, rsi_note)}"
+    return "DISTRIBUTION WATCH", f"Belum ada breakdown jelas.{note(candle_word, 'tekanan jual perlu konfirmasi', vol_note, rsi_note)}"
 
 
 def idx_market_phase(hist, mover_type):
