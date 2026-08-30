@@ -10,6 +10,7 @@ from io import BytesIO
 import requests
 import re
 import os
+import html
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from bs4 import BeautifulSoup
 import xml.etree.ElementTree as ET
@@ -5998,9 +5999,15 @@ def idx_factor_story(hist, broker_df, ticker, mover_type):
 
 
 def _idx_phase_details(x, mover_type):
-    """Menentukan fase terakhir berdasarkan bukti historis yang tersedia.
-    Tidak memaksakan satu indikator; fase dipilih dari kombinasi price action,
-    volume, momentum dan posisi terhadap support/resistance.
+    """Menentukan fase berdasarkan price action + volume secara konservatif.
+
+    Prinsip penting:
+    - Volume tinggi TIDAK otomatis berarti jual/distribusi.
+    - Arah volume dibaca dari candle (Close vs Open) dan price action.
+    - Breakout hanya disebut confirmed jika CLOSE berada di atas resistance.
+    - Jika High menembus resistance tetapi CLOSE masih di bawahnya, disebut
+      resistance test / bullish attempt, bukan breakout.
+    - Catatan fase menjelaskan alasan dalam kurung agar mudah dibaca.
     """
     if x is None or x.empty or "Close" not in x.columns:
         return "DATA TIDAK CUKUP", "History belum cukup untuk membaca fase."
@@ -6011,40 +6018,60 @@ def _idx_phase_details(x, mover_type):
 
     t = z.iloc[-1]
     close = float(t["Close"])
-    prev_close = float(z["Close"].iloc[-2]) if len(z) >= 2 else np.nan
+    open_price = float(t["Open"]) if "Open" in z.columns and pd.notna(t.get("Open")) else np.nan
+    high = float(t["High"]) if "High" in z.columns and pd.notna(t.get("High")) else np.nan
+    low = float(t["Low"]) if "Low" in z.columns and pd.notna(t.get("Low")) else np.nan
     ret = float(t.get("Return_%", np.nan)) if pd.notna(t.get("Return_%", np.nan)) else np.nan
     vol = float(t.get("Volume_Ratio", np.nan)) if pd.notna(t.get("Volume_Ratio", np.nan)) else np.nan
     rsi = float(t.get("RSI14", np.nan)) if pd.notna(t.get("RSI14", np.nan)) else np.nan
     resistance = float(t.get("Resistance20", np.nan)) if pd.notna(t.get("Resistance20", np.nan)) else np.nan
     support = float(t.get("Support20", np.nan)) if pd.notna(t.get("Support20", np.nan)) else np.nan
 
-    # Trend dan range historis.
+    # Karakter candle. Ini penting agar volume tidak salah dibaca sebagai jual.
+    candle_bull = bool(np.isfinite(open_price) and close > open_price)
+    candle_bear = bool(np.isfinite(open_price) and close < open_price)
+    candle_flat = not candle_bull and not candle_bear
+    candle_word = "candle bullish" if candle_bull else ("candle bearish" if candle_bear else "candle relatif netral")
+
     tail10 = z.tail(min(10, len(z)))
     tail5 = z.tail(min(5, len(z)))
     range10 = ((tail10["High"].max() - tail10["Low"].min()) /
                max(float(tail10["Close"].mean()), 1e-9) * 100) if "High" in z.columns and "Low" in z.columns else np.nan
-    price_slope = ((float(tail5["Close"].iloc[-1]) / float(tail5["Close"].iloc[0])) - 1) * 100 if len(tail5) >= 2 else 0.0
+    price_slope = ((float(tail5["Close"].iloc[-1]) / max(float(tail5["Close"].iloc[0]), 1e-9)) - 1) * 100 if len(tail5) >= 2 else 0.0
 
-    # Konsistensi volume 5 hari.
     vr = pd.to_numeric(z.get("Volume_Ratio", pd.Series(index=z.index, dtype=float)), errors="coerce").tail(5).dropna()
     vol_rising = len(vr) >= 4 and vr.iloc[-1] > vr.iloc[0] * 1.25 and vr.diff().mean() > 0
     volume_spike = np.isfinite(vol) and vol >= 2.0
 
-    # Posisi terhadap resistance/support.
     near_res = np.isfinite(resistance) and resistance > 0 and abs(close / resistance - 1) <= 0.025
     near_sup = np.isfinite(support) and support > 0 and abs(close / support - 1) <= 0.025
-    breakout = np.isfinite(resistance) and resistance > 0 and close > resistance
-    breakdown = np.isfinite(support) and support > 0 and close < support
+    close_breakout = np.isfinite(resistance) and resistance > 0 and close > resistance
+    close_breakdown = np.isfinite(support) and support > 0 and close < support
 
-    # Rejection di resistance/support: menyentuh area tetapi close kembali.
-    resistance_rejection = (mover_type == "Gainer" and np.isfinite(resistance) and resistance > 0
-                            and "High" in z.columns and float(t["High"]) >= resistance
-                            and close < resistance and ret < 0)
-    support_rejection = (mover_type == "Loser" and np.isfinite(support) and support > 0
-                         and "Low" in z.columns and float(t["Low"]) <= support
-                         and close > support and ret > 0)
+    # Intraday test: high/low melewati level tetapi close belum mengonfirmasi.
+    resistance_intraday_test = (
+        np.isfinite(resistance) and resistance > 0 and np.isfinite(high)
+        and high >= resistance and close <= resistance
+    )
+    support_intraday_test = (
+        np.isfinite(support) and support > 0 and np.isfinite(low)
+        and low <= support and close >= support
+    )
 
-    # Distribusi/akumulasi proxy berbasis price-volume ketika broker belum tersedia.
+    # Rejection keras: level ditembus intraday, lalu close kembali berlawanan
+    # dengan arah breakout. Tidak mensyaratkan return negatif/positif karena
+    # candle intraday dan posisi close terhadap level sudah lebih informatif.
+    resistance_rejection = (
+        resistance_intraday_test and candle_bear and
+        np.isfinite(close) and close < resistance
+    )
+    support_rejection = (
+        support_intraday_test and candle_bull and
+        np.isfinite(close) and close > support
+    )
+
+    # Distribusi/akumulasi hanya sebagai proxy price-volume. Ini BUKAN klaim
+    # broker/bandar; broker hanya boleh disimpulkan dari data broker terpisah.
     red_vol = False
     green_vol = False
     if len(tail5) >= 3 and "Volume_Ratio" in tail5.columns and "Return_%" in tail5.columns:
@@ -6052,37 +6079,159 @@ def _idx_phase_details(x, mover_type):
         green_vol = bool(((tail5["Return_%"] > 0) & (tail5["Volume_Ratio"] >= 1.5)).sum() >= 2)
 
     if mover_type == "Gainer":
-        if breakout:
-            return "BREAKOUT / TOP GAINER", f"Close {close:,.0f} berada di atas resistance {resistance:,.0f}."
-        if resistance_rejection:
-            return "RESISTANCE REJECTION", "Harga sempat menguji resistance tetapi close kembali di bawah area tersebut."
+        # 1) Close di atas resistance = breakout terkonfirmasi.
+        if close_breakout:
+            return (
+                "BREAKOUT / TOP GAINER",
+                f"Close {close:,.0f} berada di atas resistance {resistance:,.0f} "
+                f"({candle_word}; breakout terkonfirmasi oleh closing price)."
+            )
+
+        # 2) High menembus resistance tetapi close belum di atasnya.
+        # Ini tepat untuk kasus seperti MITI 27 Agustus: bullish kuat,
+        # high melewati resistance, tetapi close kembali di bawah resistance.
+        if resistance_intraday_test:
+            dist = abs(close / resistance - 1) * 100 if resistance else np.nan
+            if resistance_rejection:
+                return (
+                    "RESISTANCE REJECTION",
+                    f"High {high:,.0f} sempat melewati resistance {resistance:,.0f}, "
+                    f"tetapi close {close:,.0f} kembali di bawahnya "
+                    f"({candle_word}; breakout belum terkonfirmasi)."
+                )
+            return (
+                "RESISTANCE TEST / BULLISH ATTEMPT",
+                f"High {high:,.0f} sempat melewati resistance {resistance:,.0f}, "
+                f"sedangkan close {close:,.0f} masih di bawahnya "
+                f"({candle_word}, return {ret:+.2f}% jika tersedia; breakout belum terkonfirmasi)."
+            )
+
+        # 3) Dekat resistance tetapi belum menyentuh intraday.
         if near_res:
-            return "RESISTANCE TEST", f"Harga berada sekitar {abs(close/resistance-1)*100:.2f}% dari resistance."
+            dist = abs(close / resistance - 1) * 100
+            return (
+                "RESISTANCE TEST",
+                f"Harga berada sekitar {dist:.2f}% dari resistance "
+                f"({candle_word}; area supply sedang diuji)."
+            )
+
+        # 4) Volume spike HARUS diberi arah berdasarkan candle.
         if volume_spike:
-            return "VOLUME SPIKE", f"Volume Ratio {vol:.2f}× MA20 menunjukkan lonjakan aktivitas."
+            if candle_bull:
+                return (
+                    "BULLISH VOLUME SPIKE",
+                    f"Volume Ratio {vol:.2f}× MA20 menunjukkan lonjakan aktivitas "
+                    f"({candle_word}; kenaikan harga mendapat dukungan aktivitas transaksi tinggi)."
+                )
+            if candle_bear:
+                return (
+                    "BEARISH VOLUME SPIKE",
+                    f"Volume Ratio {vol:.2f}× MA20 menunjukkan lonjakan aktivitas "
+                    f"({candle_word}; tekanan jual terlihat dari penurunan close terhadap open)."
+                )
+            return (
+                "HIGH VOLUME / MIXED",
+                f"Volume Ratio {vol:.2f}× MA20 menunjukkan aktivitas sangat tinggi "
+                f"({candle_word}; arah tekanan belum cukup jelas dari candle)."
+            )
+
         if vol_rising and green_vol:
-            return "VOLUME EXPANSION / ACCUMULATION", "Volume meningkat konsisten dan kenaikan harga mendapat dukungan aktivitas."
+            return (
+                "VOLUME EXPANSION / ACCUMULATION",
+                f"Volume meningkat konsisten dan kenaikan harga mendapat dukungan aktivitas "
+                f"({candle_word}; ini proxy price-volume, bukan konfirmasi broker)."
+            )
         if price_slope > 2 and (not np.isfinite(rsi) or rsi < 75):
-            return "MOMENTUM BUILDING", f"Harga menguat sekitar {price_slope:+.2f}% dalam 5 hari terakhir."
+            return (
+                "MOMENTUM BUILDING",
+                f"Harga menguat sekitar {price_slope:+.2f}% dalam 5 hari terakhir "
+                f"({candle_word}; momentum jangka pendek menguat)."
+            )
         if np.isfinite(range10) and range10 < 8:
-            return "SWING / CONSOLIDATION", f"Harga masih bergerak dalam range ±{range10:.2f}% selama sekitar 10 hari."
-        return "ACCUMULATION WATCH", "Belum ada breakout yang jelas; price action masih menunjukkan fase persiapan/akumulasi."
-    else:
-        if breakdown:
-            return "BREAKDOWN / TOP LOSER", f"Close {close:,.0f} berada di bawah support {support:,.0f}."
+            return (
+                "SWING / CONSOLIDATION",
+                f"Harga masih bergerak dalam range ±{range10:.2f}% selama sekitar 10 hari "
+                f"({candle_word}; belum ada ekspansi trend yang dominan)."
+            )
+        return (
+            "ACCUMULATION WATCH",
+            f"Belum ada breakout yang jelas "
+            f"({candle_word}; price action masih menunjukkan fase persiapan/akumulasi)."
+        )
+
+    # ============================ BEARISH / LOSER ============================
+    if close_breakdown:
+        return (
+            "BREAKDOWN / TOP LOSER",
+            f"Close {close:,.0f} berada di bawah support {support:,.0f} "
+            f"({candle_word}; breakdown terkonfirmasi oleh closing price)."
+        )
+
+    if support_intraday_test:
         if support_rejection:
-            return "SUPPORT REJECTION", "Harga menembus area support intraday tetapi berhasil ditutup kembali di atasnya."
-        if near_sup:
-            return "SUPPORT TEST", f"Harga berada sekitar {abs(close/support-1)*100:.2f}% dari support."
-        if volume_spike:
-            return "SELLING VOLUME SPIKE", f"Volume Ratio {vol:.2f}× MA20 menunjukkan lonjakan aktivitas jual."
-        if vol_rising and red_vol:
-            return "VOLUME DISTRIBUTION", "Volume meningkat konsisten bersamaan dengan tekanan harga negatif."
-        if price_slope < -2 and (not np.isfinite(rsi) or rsi > 25):
-            return "MOMENTUM WEAKENING", f"Harga melemah sekitar {price_slope:+.2f}% dalam 5 hari terakhir."
-        if np.isfinite(range10) and range10 < 8:
-            return "SWING / CONSOLIDATION", f"Harga masih bergerak dalam range ±{range10:.2f}% selama sekitar 10 hari."
-        return "DISTRIBUTION WATCH", "Belum ada breakdown yang jelas; tekanan jual masih perlu dikonfirmasi history berikutnya."
+            return (
+                "SUPPORT REJECTION",
+                f"Low {low:,.0f} sempat menembus support {support:,.0f}, "
+                f"tetapi close {close:,.0f} kembali di atasnya "
+                f"({candle_word}; breakdown belum terkonfirmasi)."
+            )
+        return (
+            "SUPPORT TEST / BEARISH ATTEMPT",
+            f"Low {low:,.0f} sempat menembus support {support:,.0f}, "
+            f"sedangkan close {close:,.0f} masih di atasnya "
+            f"({candle_word}; breakdown belum terkonfirmasi)."
+        )
+
+    if near_sup:
+        dist = abs(close / support - 1) * 100
+        return (
+            "SUPPORT TEST",
+            f"Harga berada sekitar {dist:.2f}% dari support "
+            f"({candle_word}; area demand sedang diuji)."
+        )
+
+    if volume_spike:
+        if candle_bear:
+            return (
+                "BEARISH VOLUME SPIKE",
+                f"Volume Ratio {vol:.2f}× MA20 menunjukkan lonjakan aktivitas "
+                f"({candle_word}; tekanan jual terlihat dari penurunan close terhadap open)."
+            )
+        if candle_bull:
+            return (
+                "BULLISH VOLUME SPIKE",
+                f"Volume Ratio {vol:.2f}× MA20 menunjukkan lonjakan aktivitas "
+                f"({candle_word}; terdapat rebound/tekanan beli meskipun konteks keseluruhan bearish)."
+            )
+        return (
+            "HIGH VOLUME / MIXED",
+            f"Volume Ratio {vol:.2f}× MA20 menunjukkan aktivitas sangat tinggi "
+            f"({candle_word}; arah tekanan belum cukup jelas dari candle)."
+        )
+
+    if vol_rising and red_vol:
+        return (
+            "VOLUME DISTRIBUTION",
+            f"Volume meningkat konsisten bersamaan dengan tekanan harga negatif "
+            f"({candle_word}; proxy price-volume, bukan konfirmasi broker)."
+        )
+    if price_slope < -2 and (not np.isfinite(rsi) or rsi > 25):
+        return (
+            "MOMENTUM WEAKENING",
+            f"Harga melemah sekitar {price_slope:+.2f}% dalam 5 hari terakhir "
+            f"({candle_word}; momentum jangka pendek melemah)."
+        )
+    if np.isfinite(range10) and range10 < 8:
+        return (
+            "SWING / CONSOLIDATION",
+            f"Harga masih bergerak dalam range ±{range10:.2f}% selama sekitar 10 hari "
+            f"({candle_word}; belum ada ekspansi trend yang dominan)."
+        )
+    return (
+        "DISTRIBUTION WATCH",
+        f"Belum ada breakdown yang jelas "
+        f"({candle_word}; tekanan jual masih perlu dikonfirmasi history berikutnya)."
+    )
 
 
 def idx_market_phase(hist, mover_type):
@@ -6101,8 +6250,12 @@ def _idx_phase_style(phase):
         return "color:#22c55e;font-weight:700;"
     if "TOP LOSER" in p or "BREAKDOWN" in p:
         return "color:#ef4444;font-weight:700;"
-    if "VOLUME SPIKE" in p or "SELLING VOLUME SPIKE" in p:
+    if "VOLUME SPIKE" in p or "SELLING VOLUME SPIKE" in p or "HIGH VOLUME" in p:
         return "color:#f97316;font-weight:700;"
+    if "BULLISH VOLUME" in p:
+        return "color:#22c55e;font-weight:700;"
+    if "BEARISH VOLUME" in p:
+        return "color:#ef4444;font-weight:700;"
     if "VOLUME EXPANSION" in p:
         return "color:#06b6d4;font-weight:700;"
     if "ACCUMULATION" in p:
@@ -6316,18 +6469,116 @@ def render_idx_sector_module():
         "RSI14":"{:.1f}","ATR_%":"{:.2f}%","MA20":"{:,.0f}","MA50":"{:,.0f}",
         "Resistance20":"{:,.0f}","Support20":"{:,.0f}"
     }
-    styler = story_display[cols].style.format({k:v for k,v in fmt.items() if k in story_display.columns})
-    # Hanya warna teks Phase dan Keterangan agar timeline tidak menjadi blok-blok warna.
-    def _row_phase_style(row):
-        style = pd.Series("", index=row.index)
-        phase_css = _idx_phase_style(row.get("Phase", ""))
-        style["Phase"] = phase_css
-        style["Keterangan"] = phase_css
-        return style
-    styler = styler.apply(_row_phase_style, axis=1)
-    styler = styler.set_properties(subset=["Keterangan"], **{"text-align":"left", "min-width":"320px"})
-    st.dataframe(styler, use_container_width=True, hide_index=True)
-    st.caption("Warna fase: 🟩 breakout/gainer • 🟥 breakdown/loser/distribution • 🟧 volume spike • 🟨 resistance • 🟦 support • 🟪 momentum • ⬜ swing/consolidation.")
+    # Render sebagai HTML agar kolom Keterangan dapat WRAP dan seluruh teks terbaca.
+    # Hanya warna teks Phase + Keterangan; tidak ada highlight/blok warna per baris.
+    def _fmt_story_value(col, value):
+        if pd.isna(value):
+            return "—"
+        try:
+            if col == "Date":
+                return pd.to_datetime(value).strftime("%d-%m-%Y")
+            if col in {"Open", "High", "Low", "Close", "MA20", "MA50", "Resistance20", "Support20"}:
+                return f"{float(value):,.0f}"
+            if col == "Return_%":
+                return f"{float(value):+.2f}%"
+            if col == "Volume":
+                return f"{float(value):,.0f}"
+            if col == "Volume_Ratio":
+                return f"{float(value):.2f}×"
+            if col == "RSI14":
+                return f"{float(value):.1f}"
+            if col == "ATR_%":
+                return f"{float(value):.2f}%"
+        except Exception:
+            pass
+        return str(value)
+
+    headers = {
+        "Date":"Date", "Open":"Open", "High":"High", "Low":"Low", "Close":"Close",
+        "Return_%":"Return", "Volume":"Volume", "Volume_Ratio":"Vol Ratio", "RSI14":"RSI",
+        "ATR_%":"ATR %", "MA20":"MA20", "MA50":"MA50", "Resistance20":"Resistance",
+        "Support20":"Support", "Phase":"Phase", "Keterangan":"Keterangan"
+    }
+    numeric_cols = {
+        "Open","High","Low","Close","Return_%","Volume","Volume_Ratio","RSI14",
+        "ATR_%","MA20","MA50","Resistance20","Support20"
+    }
+    html_rows = []
+    for _, row in story_display[cols].iterrows():
+        phase = str(row.get("Phase", ""))
+        phase_css = _idx_phase_style(phase)
+        cells = []
+        for col in cols:
+            value = _fmt_story_value(col, row.get(col, np.nan))
+            safe = html.escape(value)
+            if col == "Phase":
+                cells.append(f'<td class="phase" style="{phase_css}">{safe}</td>')
+            elif col == "Keterangan":
+                cells.append(f'<td class="note" style="{phase_css}">{safe}</td>')
+            else:
+                cls = "num" if col in numeric_cols else ""
+                cells.append(f'<td class="{cls}">{safe}</td>')
+        html_rows.append("<tr>" + "".join(cells) + "</tr>")
+
+    html_headers = "".join(f'<th>{html.escape(headers.get(c, c))}</th>' for c in cols)
+    table_html = f'''
+    <div class="idx-story-wrap">
+      <table class="idx-story-table">
+        <thead><tr>{html_headers}</tr></thead>
+        <tbody>{"".join(html_rows)}</tbody>
+      </table>
+    </div>
+    <style>
+      .idx-story-wrap {{
+        width: 100%;
+        max-height: 760px;
+        overflow: auto;
+        border: 1px solid rgba(148,163,184,.22);
+        border-radius: 6px;
+      }}
+      .idx-story-table {{
+        width: max-content;
+        min-width: 100%;
+        border-collapse: collapse;
+        table-layout: auto;
+        font-size: 12px;
+        line-height: 1.35;
+      }}
+      .idx-story-table th {{
+        position: sticky;
+        top: 0;
+        z-index: 2;
+        text-align: left;
+        padding: 8px 9px;
+        background: rgba(15,23,42,.98);
+        border-bottom: 1px solid rgba(148,163,184,.30);
+        white-space: nowrap;
+        color: #cbd5e1;
+        font-weight: 700;
+      }}
+      .idx-story-table td {{
+        padding: 7px 9px;
+        border-bottom: 1px solid rgba(148,163,184,.14);
+        vertical-align: top;
+        white-space: nowrap;
+        color: #d1d5db;
+        background: transparent;
+      }}
+      .idx-story-table td.num {{ text-align: right; font-variant-numeric: tabular-nums; }}
+      .idx-story-table td.phase {{ white-space: nowrap; min-width: 175px; }}
+      .idx-story-table td.note {{
+        white-space: normal;
+        width: 560px;
+        min-width: 560px;
+        max-width: 700px;
+        overflow-wrap: anywhere;
+        word-break: normal;
+      }}
+      .idx-story-table tbody tr:hover td {{ background: rgba(148,163,184,.045); }}
+    </style>
+    '''
+    st.markdown(table_html, unsafe_allow_html=True)
+    st.caption("Warna teks: 🟢 breakout/gainer • 🔴 breakdown/loser/distribution • 🟧 volume spike • 🟨 resistance • 🟦 support • 🟪 momentum • ⬜ swing/consolidation. Kolom Keterangan dibuat wrap agar seluruh penjelasan terbaca.")
 
     # =====================================================
     # FAKTOR DINAMIS
@@ -6335,9 +6586,23 @@ def render_idx_sector_module():
     factors, conclusion = idx_factor_story(story, broker_df, ticker_input, selected_type)
     st.markdown("### 🔥 Faktor yang Paling Berpengaruh")
     if factors:
-        for i,(name,score,evidence) in enumerate(factors[:8],1):
-            prefix = "🔥" if i <= 3 else "🟢"
-            st.markdown(f"{prefix} **{name} — Score {score}/100**  \n{evidence}")
+        # Dua kolom agar daftar faktor tidak memanjang terlalu jauh ke bawah.
+        left_factors, right_factors = st.columns(2, gap="large")
+
+        mid = (min(len(factors), 8) + 1) // 2
+        factor_groups = [factors[:mid], factors[mid:8]]
+
+        for col, group in zip((left_factors, right_factors), factor_groups):
+            with col:
+                for i, (name, score, evidence) in enumerate(group, 1):
+                    # Nomor tetap mengikuti ranking global.
+                    global_i = (0 if col is left_factors else mid) + i
+                    prefix = "🔥" if global_i <= 3 else "🟢"
+                    st.markdown(
+                        f"{prefix} **{global_i}. {name} — Score {score}/100**  \n{evidence}"
+                    )
+                    if i < len(group):
+                        st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
     else:
         st.info("Belum ada faktor dominan yang cukup kuat. Jangan memaksakan kesimpulan dari satu indikator.")
 
